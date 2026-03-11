@@ -1,0 +1,115 @@
+name: Build gossip-listener binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release (if missing)
+        run: |
+          if gh release view "${{ github.ref_name }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ github.ref_name }} already exists."
+          else
+            gh release create "${{ github.ref_name }}" -R "${{ github.repository }}" --generate-notes
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-release:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: gossip-listener-${{ github.ref_name }}-linux-x86_64.tar.gz
+            bin_path: target/x86_64-unknown-linux-gnu/release/gossip-listener
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: gossip-listener-${{ github.ref_name }}-linux-aarch64.tar.gz
+            bin_path: target/aarch64-unknown-linux-gnu/release/gossip-listener
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: gossip-listener-${{ github.ref_name }}-macos-x86_64.tar.gz
+            bin_path: target/x86_64-apple-darwin/release/gossip-listener
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: gossip-listener-${{ github.ref_name }}-macos-aarch64.tar.gz
+            bin_path: target/aarch64-apple-darwin/release/gossip-listener
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: gossip-listener-${{ github.ref_name }}-windows-x86_64.zip
+            bin_path: target\x86_64-pc-windows-msvc\release\gossip-listener.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross compiler
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --manifest-path gossip-listener/Cargo.toml --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package (tar.gz)
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: |
+          mkdir -p dist
+          cp "gossip-listener/${{ matrix.bin_path }}" dist/
+          tar -czf "dist/${{ matrix.artifact_name }}" -C dist gossip-listener
+
+      - name: Package (zip)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "gossip-listener\${{ matrix.bin_path }}" dist\gossip-listener.exe
+          Compress-Archive -Path dist\gossip-listener.exe -DestinationPath "dist\${{ matrix.artifact_name }}"
+        shell: pwsh
+
+      - name: Upload release asset
+        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact_name }}" --clobber -R "${{ github.repository }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate checksums
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: |
+          cd dist
+          shasum -a 256 "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256"
+
+      - name: Generate checksums (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          $Path = "dist\${{ matrix.artifact_name }}"
+          $Hash = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLower()
+          "$Hash  ${{ matrix.artifact_name }}" | Out-File -Encoding ascii -FilePath "dist\${{ matrix.artifact_name }}.sha256"
+        shell: pwsh
+
+      - name: Upload checksum asset
+        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact_name }}.sha256" --clobber -R "${{ github.repository }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

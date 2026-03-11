@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  gossip-listener:
+    image: ghcr.io/suorcd/gossip-listener:latest
+    container_name: gossip-listener
+    restart: unless-stopped
+    environment:
+      IROH_NODE_KEY_FILE: /data/gossip_listener_node.key
+      KNOWN_PEERS_FILE: /data/gossip_listener_known_peers.txt
+      TRUSTED_PUBLISHERS_FILE: /data/trusted_publishers.txt
+      DHT_INITIAL_SECRET: podping_gossip_default_secret
+    volumes:
+      - ./data/gossip-listener:/data
