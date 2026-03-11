@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::Write;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -25,6 +25,7 @@ const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
 const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
+const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 
 //Structs ------------------------------------------------------------------------------------------
 
@@ -206,6 +207,206 @@ impl GossipNotification {
     }
 }
 
+//ArchiveSyncHandler - serves archived notifications to peers over a custom ALPN protocol
+#[derive(Debug, Clone)]
+struct ArchiveSyncHandler {
+    db: Arc<Mutex<archive::Archive>>,
+}
+
+impl iroh::protocol::ProtocolHandler for ArchiveSyncHandler {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        // Read 8-byte big-endian u64 since_timestamp
+        let mut ts_buf = [0u8; 8];
+        recv.read_exact(&mut ts_buf).await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("read timestamp: {e}")))?;
+        let since = u64::from_be_bytes(ts_buf);
+
+        println!(
+            "\x1b[36m[SYNC] Peer requested catch-up since {} ({}s ago)\x1b[0m",
+            since,
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().saturating_sub(since)
+        );
+
+        let payloads = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("\x1b[35m[SYNC] Archive lock poisoned: {}\x1b[0m", e);
+                    return Ok(());
+                }
+            };
+            db.messages_since(since).unwrap_or_default()
+        };
+
+        // Cap response to avoid OOM on very large archives
+        let payloads: Vec<_> = if payloads.len() > 50_000 {
+            println!("\x1b[33m[SYNC] Capping response at 50000 of {} messages\x1b[0m", payloads.len());
+            payloads.into_iter().take(50_000).collect()
+        } else {
+            payloads
+        };
+
+        for payload in &payloads {
+            let len = (payload.len() as u32).to_be_bytes();
+            send.write_all(&len).await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("write len: {e}")))?;
+            send.write_all(payload).await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("write payload: {e}")))?;
+        }
+
+        send.finish()?;
+        println!("\x1b[36m[SYNC] Sent {} archived notifications\x1b[0m", payloads.len());
+
+        Ok(())
+    }
+}
+
+//Catch-up client - connects to a peer and downloads missed notifications
+async fn run_catchup(
+    endpoint: &iroh::Endpoint,
+    since: u64,
+    peers_file: &str,
+    bootstrap_str: &str,
+    neighbor_rx: &mut tokio::sync::mpsc::Receiver<iroh::EndpointId>,
+    trusted_publishers: &Arc<RwLock<HashSet<String>>>,
+    last_notification_time: &Arc<AtomicU64>,
+    db: &Option<Arc<Mutex<archive::Archive>>>,
+) {
+    println!("\x1b[36m[CATCHUP] Starting catch-up from {}s ago\x1b[0m",
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().saturating_sub(since));
+
+    // Build candidate peer list
+    let mut candidate_peers: Vec<iroh::EndpointId> = bootstrap_str
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let file_peers = load_known_peers(peers_file);
+    for p in file_peers {
+        if !candidate_peers.contains(&p) {
+            candidate_peers.push(p);
+        }
+    }
+
+    // Try each known peer
+    let mut conn: Option<iroh::endpoint::Connection> = None;
+    for peer_id in &candidate_peers {
+        println!("\x1b[36m[CATCHUP] Trying peer {}...\x1b[0m", peer_id);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            endpoint.connect(*peer_id, ARCHIVE_SYNC_ALPN),
+        ).await {
+            Ok(Ok(c)) => {
+                println!("\x1b[32m[CATCHUP] Connected to {}\x1b[0m", peer_id);
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => println!("\x1b[33m[CATCHUP] Peer {} refused: {}\x1b[0m", peer_id, e),
+            Err(_) => println!("\x1b[33m[CATCHUP] Peer {} timed out\x1b[0m", peer_id),
+        }
+    }
+
+    // Fallback: wait for first NeighborUp
+    if conn.is_none() {
+        println!("\x1b[33m[CATCHUP] No known peers responded, waiting for NeighborUp...\x1b[0m");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            neighbor_rx.recv(),
+        ).await {
+            Ok(Some(peer_id)) => {
+                println!("\x1b[36m[CATCHUP] Trying NeighborUp peer {}...\x1b[0m", peer_id);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    endpoint.connect(peer_id, ARCHIVE_SYNC_ALPN),
+                ).await {
+                    Ok(Ok(c)) => {
+                        println!("\x1b[32m[CATCHUP] Connected to {}\x1b[0m", peer_id);
+                        conn = Some(c);
+                    }
+                    Ok(Err(e)) => println!("\x1b[35m[CATCHUP] NeighborUp peer refused: {}\x1b[0m", e),
+                    Err(_) => println!("\x1b[35m[CATCHUP] NeighborUp peer timed out\x1b[0m"),
+                }
+            }
+            Ok(None) => println!("\x1b[35m[CATCHUP] NeighborUp channel closed\x1b[0m"),
+            Err(_) => println!("\x1b[35m[CATCHUP] Timed out waiting for NeighborUp\x1b[0m"),
+        }
+    }
+
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            println!("\x1b[35m[CATCHUP] Catch-up failed — continuing with live-only mode\x1b[0m");
+            return;
+        }
+    };
+
+    // Open bidi stream and send since_timestamp
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            eprintln!("\x1b[35m[CATCHUP] Failed to open stream: {}\x1b[0m", e);
+            return;
+        }
+    };
+
+    if let Err(e) = send.write_all(&since.to_be_bytes()).await {
+        eprintln!("\x1b[35m[CATCHUP] Failed to send timestamp: {}\x1b[0m", e);
+        return;
+    }
+    let _ = send.finish();
+
+    // Read length-prefixed payloads
+    let mut count = 0u64;
+    loop {
+        let mut len_buf = [0u8; 4];
+        match recv.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 10_000_000 {
+            break;
+        }
+
+        let mut payload = vec![0u8; len];
+        if recv.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+
+        if let Ok(notif) = serde_json::from_slice::<GossipNotification>(&payload) {
+            let tp = trusted_publishers.read().unwrap();
+            if tp.is_empty() || tp.contains(&notif.sender) {
+                print_notification(&notif);
+                if let Some(ref db_arc) = db {
+                    let db_lock = db_arc.lock().unwrap();
+                    match db_lock.store(
+                        &payload,
+                        &notif.sender,
+                        &notif.medium,
+                        &notif.reason,
+                        notif.timestamp,
+                        notif.iris.len(),
+                    ) {
+                        Ok(true) => println!("\x1b[36m[ARCHIVE] Stored (catchup)\x1b[0m"),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("\x1b[35m[WARN] Archive error: {}\x1b[0m", e),
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    last_notification_time.store(now, Ordering::Relaxed);
+    println!("\x1b[32m[CATCHUP] Catch-up complete: received {} notifications\x1b[0m", count);
+}
+
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -234,11 +435,11 @@ async fn main() -> anyhow::Result<()> {
     let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
 
     // Optionally open SQLite archive
-    let db = if archive_enabled {
+    let db: Option<Arc<Mutex<archive::Archive>>> = if archive_enabled {
         match archive::Archive::open(&archive_path) {
             Ok(a) => {
                 println!("  Archive DB ready: {}", archive_path);
-                Some(a)
+                Some(Arc::new(Mutex::new(a)))
             }
             Err(e) => {
                 eprintln!("\x1b[35m[WARN] Failed to open archive DB: {}\x1b[0m", e);
@@ -249,9 +450,14 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let catchup_enabled = env::var("CATCHUP_ENABLED")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
     println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
+    println!("  Catch-up:     {}", if catchup_enabled { "enabled" } else { "disabled" });
     println!("  Trusted publishers file: {}", trusted_publishers_file);
     {
         let tp = trusted_publishers.read().unwrap();
@@ -283,9 +489,16 @@ async fn main() -> anyhow::Result<()> {
     let gossip = Gossip::builder()
         .max_message_size(65536)
         .spawn(endpoint.clone());
-    let _router = Router::builder(endpoint.clone())
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
+    let mut router_builder = Router::builder(endpoint.clone())
+        .accept(iroh_gossip::ALPN, gossip.clone());
+
+    if let Some(ref db_arc) = db {
+        let handler = ArchiveSyncHandler { db: db_arc.clone() };
+        router_builder = router_builder.accept(ARCHIVE_SYNC_ALPN, handler);
+        println!("  Archive sync: serving on ALPN {}", std::str::from_utf8(ARCHIVE_SYNC_ALPN).unwrap());
+    }
+
+    let _router = router_builder.spawn();
 
     // Bootstrap this node over DHT
     let dht_signing_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
@@ -441,6 +654,49 @@ async fn main() -> anyhow::Result<()> {
         "\n  Listening for gossip notifications. This will take a minute. Patience grasshopper...\n"
     );
 
+    // Channel for forwarding NeighborUp to catch-up task (if enabled)
+    let neighbor_tx_for_event: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>> = if catchup_enabled {
+        let catchup_endpoint = endpoint.clone();
+        let catchup_peers_file = peers_file.clone();
+        let catchup_bootstrap_str = bootstrap_peer_ids_str.clone();
+        let catchup_trusted = trusted_publishers.clone();
+        let catchup_last = last_notification_time.clone();
+        let catchup_db = db.clone();
+
+        let since = if let Some(ref db_arc) = db {
+            let db_lock = db_arc.lock().unwrap();
+            db_lock.latest_timestamp()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 86400
+                })
+        } else {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 86400
+        };
+
+        let (neighbor_tx, mut neighbor_rx) = tokio::sync::mpsc::channel::<iroh::EndpointId>(1);
+        let tx_arc = Arc::new(Mutex::new(Some(neighbor_tx)));
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            run_catchup(
+                &catchup_endpoint,
+                since,
+                &catchup_peers_file,
+                &catchup_bootstrap_str,
+                &mut neighbor_rx,
+                &catchup_trusted,
+                &catchup_last,
+                &catchup_db,
+            ).await;
+        });
+
+        tx_arc
+    } else {
+        Arc::new(Mutex::new(None))
+    };
+
     // Main receive loop.  CTRL+C to close
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -448,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -469,7 +725,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<archive::Archive>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -541,8 +797,9 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
                             print_notification(&notif);
-                            if let Some(db) = db {
-                                match db.store(
+                            if let Some(ref db_arc) = db {
+                                let db_lock = db_arc.lock().unwrap();
+                                match db_lock.store(
                                     raw,
                                     &notif.sender,
                                     &notif.medium,
@@ -569,6 +826,13 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
         Event::NeighborUp(node_id) => {
             println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
             save_peer_if_new(peers_file, &node_id, my_node_id);
+            // Forward to catch-up task if waiting (std::sync::Mutex is fine here:
+            // lock held briefly, no .await while held, called from sync function)
+            let mut tx_guard = neighbor_tx.lock().unwrap();
+            if let Some(tx) = tx_guard.as_ref() {
+                let _ = tx.try_send(node_id);
+                *tx_guard = None;
+            }
         }
         Event::NeighborDown(node_id) => {
             println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
