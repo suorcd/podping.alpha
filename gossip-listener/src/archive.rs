@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug)]
 pub struct Archive {
     conn: Connection,
 }
@@ -83,5 +84,28 @@ impl Archive {
         )?;
 
         Ok(inserted > 0)
+    }
+
+    /// Return all message payloads whose `created_at >= since` (unix seconds),
+    /// ordered by created_at ASC.
+    pub fn messages_since(&self, since: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM messages WHERE created_at >= ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt
+            .query_map(params![since as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    /// Return the latest `created_at` timestamp in the archive, or `None` if empty.
+    pub fn latest_timestamp(&self) -> Result<Option<u64>, Box<dyn Error>> {
+        let result: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(created_at) FROM messages", [], |row| row.get(0))?;
+
+        Ok(result.map(|ts| ts as u64))
     }
 }
