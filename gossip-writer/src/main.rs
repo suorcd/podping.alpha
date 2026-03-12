@@ -50,11 +50,15 @@ struct PeerAnnounce {
     node_list: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    friendly_name: Option<String>,
 }
 
 // Canonical form for peer_endorse signing (alphabetical by serialized key name)
 #[derive(Serialize)]
 struct CanonicalPeerEndorse<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    friendly_name: Option<&'a str>,
     node_id: &'a str,
     node_list: &'a Vec<String>,
     sender: &'a str,
@@ -65,7 +69,7 @@ struct CanonicalPeerEndorse<'a> {
 }
 
 impl PeerAnnounce {
-    fn new(node_id: &str, version: &str) -> Self {
+    fn new(node_id: &str, version: &str, friendly_name: Option<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -78,10 +82,11 @@ impl PeerAnnounce {
             sender: None,
             node_list: None,
             signature: None,
+            friendly_name,
         }
     }
 
-    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>) -> Self {
+    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>, friendly_name: Option<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -94,11 +99,13 @@ impl PeerAnnounce {
             sender: Some(sender.to_string()),
             node_list: Some(endorsed_keys),
             signature: None,
+            friendly_name,
         }
     }
 
     fn canonical_endorse_bytes(&self) -> Vec<u8> {
         let canonical = CanonicalPeerEndorse {
+            friendly_name: self.friendly_name.as_deref(),
             node_id: &self.node_id,
             node_list: self.node_list.as_ref().expect("node_list required for endorse"),
             sender: self.sender.as_ref().expect("sender required for endorse"),
@@ -199,6 +206,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let archive_enabled = env::var("ARCHIVE_ENABLED")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    let friendly_name: Option<String> = env::var("NODE_FRIENDLY_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.len() > 64 {
+                eprintln!("  Warning: NODE_FRIENDLY_NAME truncated to 64 characters");
+                s.chars().take(64).collect::<String>()
+            } else {
+                s
+            }
+        });
 
     let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
 
@@ -212,6 +231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Announce interval: {}s", peer_announce_interval);
     println!("  Endorse interval: {}s", peer_endorse_interval);
     println!("  Auto-trust endorsements: {}", auto_trust_endorsements);
+    if let Some(ref name) = friendly_name {
+        println!("  Friendly name: {}", name);
+    }
     println!("  DHT discovery: enabled");
     println!("  Trusted publishers file: {}", trusted_publishers_file);
     {
@@ -317,10 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Periodic PeerAnnounce task ---
     if peer_announce_interval > 0 {
         let announce_node_id = my_node_id.to_string();
+        let announce_friendly = friendly_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
-                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"));
+                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"), announce_friendly.clone());
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         if let Err(e) = announce_tx.send(payload).await {
@@ -342,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let endorse_pubkey = pubkey_hex.clone();
         let endorse_signing_key = signing_key.clone();
         let endorse_trusted = trusted_publishers.clone();
+        let endorse_friendly = friendly_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_endorse_interval)).await;
@@ -357,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     env!("CARGO_PKG_VERSION"),
                     &endorse_pubkey,
                     keys,
+                    endorse_friendly.clone(),
                 );
                 endorse.sign_endorse(&endorse_signing_key);
                 match serde_json::to_vec(&endorse) {

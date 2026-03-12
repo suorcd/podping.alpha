@@ -115,6 +115,7 @@ All configuration is via environment variables. Every variable is optional.
 | `KNOWN_PEERS_FILE` | `gossip_listener_known_peers.txt` | Path to read/write discovered peer IDs (max 15) |
 | `DHT_INITIAL_SECRET` | `podping_gossip_default_secret` | Shared secret for DHT auto-discovery |
 | `TRUSTED_PUBLISHERS_FILE` | `trusted_publishers.txt` | Path to a file of trusted ed25519 public keys (hex, one per line). Empty = accept all |
+| `NODE_FRIENDLY_NAME` | *(none)* | Optional human-readable node name (max 64 chars), broadcast in PeerAnnounce/PeerEndorse |
 | `PEER_ANNOUNCE_INTERVAL` | `300` | Seconds between broadcasting `PeerAnnounce` messages |
 | `PEER_ENDORSE_INTERVAL` | `45` | Seconds between broadcasting `PeerEndorse` messages |
 

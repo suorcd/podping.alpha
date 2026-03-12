@@ -1,6 +1,6 @@
 mod archive;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -46,11 +46,15 @@ struct PeerAnnounce {
     node_list: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    friendly_name: Option<String>,
 }
 
 // Canonical form for peer_endorse signing (alphabetical by serialized key name)
 #[derive(Serialize)]
 struct CanonicalPeerEndorse<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    friendly_name: Option<&'a str>,
     node_id: &'a str,
     node_list: &'a Vec<String>,
     sender: &'a str,
@@ -61,7 +65,7 @@ struct CanonicalPeerEndorse<'a> {
 }
 
 impl PeerAnnounce {
-    fn new(node_id: &str, version: &str) -> Self {
+    fn new(node_id: &str, version: &str, friendly_name: Option<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -74,10 +78,11 @@ impl PeerAnnounce {
             sender: None,
             node_list: None,
             signature: None,
+            friendly_name,
         }
     }
 
-    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>) -> Self {
+    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>, friendly_name: Option<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -90,11 +95,13 @@ impl PeerAnnounce {
             sender: Some(sender.to_string()),
             node_list: Some(endorsed_keys),
             signature: None,
+            friendly_name,
         }
     }
 
     fn canonical_endorse_bytes(&self) -> Vec<u8> {
         let canonical = CanonicalPeerEndorse {
+            friendly_name: self.friendly_name.as_deref(),
             node_id: &self.node_id,
             node_list: self.node_list.as_ref().expect("node_list required for endorse"),
             sender: self.sender.as_ref().expect("sender required for endorse"),
@@ -381,7 +388,8 @@ async fn run_catchup(
         if let Ok(notif) = serde_json::from_slice::<GossipNotification>(&payload) {
             let tp = trusted_publishers.read().unwrap();
             if tp.is_empty() || tp.contains(&notif.sender) {
-                print_notification(&notif);
+                let sender_display = notif.sender[..8.min(notif.sender.len())].to_string();
+                print_notification(&notif, &sender_display);
                 if let Some(ref db_arc) = db {
                     let db_lock = db_arc.lock().unwrap();
                     match db_lock.store(
@@ -410,7 +418,7 @@ async fn run_catchup(
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("--- Podping Gossip Listener ---\n");
+    println!("gossip-listener v{}\n", env!("CARGO_PKG_VERSION"));
 
     // Configure from the environment
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
@@ -454,10 +462,26 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
 
+    let friendly_name: Option<String> = env::var("NODE_FRIENDLY_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.len() > 64 {
+                eprintln!("  Warning: NODE_FRIENDLY_NAME truncated to 64 characters");
+                s.chars().take(64).collect::<String>()
+            } else {
+                s
+            }
+        });
+
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
     println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
     println!("  Catch-up:     {}", if catchup_enabled { "enabled" } else { "disabled" });
+    if let Some(ref name) = friendly_name {
+        println!("  Friendly name: {}", name);
+    }
     println!("  Trusted publishers file: {}", trusted_publishers_file);
     {
         let tp = trusted_publishers.read().unwrap();
@@ -482,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
 
     //Self assign an Iroh node id
     let my_node_id = endpoint.id();
+    let peer_names: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
     println!("  Iroh Node ID: {}", my_node_id);
     println!("  Sender pubkey: {}", pubkey_hex);
 
@@ -552,10 +577,11 @@ async fn main() -> anyhow::Result<()> {
     if peer_announce_interval > 0 {
         let announce_sender = gossip_sender.clone();
         let announce_node_id = my_node_id.to_string();
+        let announce_friendly = friendly_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
-                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"));
+                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"), announce_friendly.clone());
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         if let Err(e) = announce_sender.broadcast(payload).await {
@@ -577,6 +603,7 @@ async fn main() -> anyhow::Result<()> {
         let endorse_pubkey = pubkey_hex.clone();
         let endorse_signing_key = signing_key.clone();
         let endorse_trusted = trusted_publishers.clone();
+        let endorse_friendly = friendly_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_endorse_interval)).await;
@@ -592,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
                     env!("CARGO_PKG_VERSION"),
                     &endorse_pubkey,
                     keys,
+                    endorse_friendly.clone(),
                 );
                 endorse.sign_endorse(&endorse_signing_key);
                 match serde_json::to_vec(&endorse) {
@@ -698,13 +726,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Main receive loop.  CTRL+C to close
+    let recv_peer_names = peer_names.clone();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event, &recv_peer_names),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -725,19 +754,36 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
-                    println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                    if let Some(ref name) = announce.friendly_name {
+                        let display_name = sanitize_friendly_name(name);
+                        println!("\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m", display_name, announce.node_id, announce.version);
+                    } else {
+                        println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                    }
                     if version_is_newer(&announce.version, env!("CARGO_PKG_VERSION")) {
                         println!("\x1b[1;41;37m *** A newer version (v{}) is available! You are running v{}. Please upgrade. *** \x1b[0m", announce.version, env!("CARGO_PKG_VERSION"));
                     }
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
+                    }
+                    if let Some(ref name) = announce.friendly_name {
+                        let sanitized = sanitize_friendly_name(name);
+                        if !sanitized.is_empty() {
+                            let key = announce.node_id.clone();
+                            let mut names = peer_names.write().unwrap();
+                            let is_new = names.get(&key).map_or(true, |old| *old != sanitized);
+                            names.insert(key, sanitized);
+                            if is_new {
+                                print_peer_table(&names);
+                            }
+                        }
                     }
                 } else if announce.msg_type == "peer_endorse" {
                     // Verify signature
@@ -769,6 +815,28 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                         return;
                     }
 
+                    if let Some(ref name) = announce.friendly_name {
+                        let sanitized = sanitize_friendly_name(name);
+                        if !sanitized.is_empty() {
+                            let mut names = peer_names.write().unwrap();
+                            // Store under both sender pubkey (for notification display)
+                            // and node_id (for peer table consistency)
+                            let mut changed = false;
+                            if names.get(&sender).map_or(true, |old| *old != sanitized) {
+                                names.insert(sender.clone(), sanitized.clone());
+                                changed = true;
+                            }
+                            let node_key = announce.node_id.clone();
+                            if names.get(&node_key).map_or(true, |old| *old != sanitized) {
+                                names.insert(node_key, sanitized);
+                                changed = true;
+                            }
+                            if changed {
+                                print_peer_table(&names);
+                            }
+                        }
+                    }
+
                     // Add endorsed keys
                     if let Some(ref node_list) = announce.node_list {
                         let mut added = 0;
@@ -796,7 +864,14 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                         last_notification_time.store(now, Ordering::Relaxed);
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
-                            print_notification(&notif);
+                            let sender_display = {
+                                let names = peer_names.read().unwrap();
+                                match names.get(&notif.sender) {
+                                    Some(name) => format!("\"{}\" ({})", name, &notif.sender[..8.min(notif.sender.len())]),
+                                    None => notif.sender[..8.min(notif.sender.len())].to_string(),
+                                }
+                            };
+                            print_notification(&notif, &sender_display);
                             if let Some(ref db_arc) = db {
                                 let db_lock = db_arc.lock().unwrap();
                                 match db_lock.store(
@@ -844,7 +919,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
 }
 
 //Pretty print messages
-fn print_notification(notif: &GossipNotification) {
+fn print_notification(notif: &GossipNotification, sender_display: &str) {
     let sig_status = match notif.verify_signature() {
         Ok(true) => "VALID",
         Ok(false) => "UNSIGNED",
@@ -854,8 +929,28 @@ fn print_notification(notif: &GossipNotification) {
     let mut json = serde_json::to_value(notif).unwrap_or_default();
     if let Some(obj) = json.as_object_mut() {
         obj.insert("sig_status".to_string(), serde_json::Value::String(sig_status.to_string()));
+        obj.insert("sender_name".to_string(), serde_json::Value::String(sender_display.to_string()));
     }
     println!("PODPING: [{}]", serde_json::to_string(&json).unwrap_or_default());
+}
+
+// Sanitize a friendly name received from a remote peer: strip control chars, limit to 64 chars
+fn sanitize_friendly_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn print_peer_table(names: &HashMap<String, String>) {
+    println!("\x1b[36m--- Known peers ({}) ---\x1b[0m", names.len());
+    for (key, name) in names {
+        let short_key = &key[..16.min(key.len())];
+        println!("\x1b[36m  \"{}\"  -> {}...\x1b[0m", name, short_key);
+    }
+    println!("\x1b[36m---\x1b[0m");
 }
 
 // Compare two semver-style version strings (e.g. "0.1.4").
