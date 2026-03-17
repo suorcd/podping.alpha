@@ -50,6 +50,7 @@
         commonArgs = {
           src = gossipListenerSrc;
           cargoToml = ./gossip-listener/Cargo.toml;
+          cargoLock = ./gossip-listener/Cargo.lock;
           strictDeps = true;
 
           # Git dependencies cause lock file drift after vendoring
