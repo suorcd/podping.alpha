@@ -32,8 +32,8 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # Include gossip-listener and dtt-fork (local path dependency).
-        # The source root stays at the repo level so that the relative
-        # path `../dtt-fork` in gossip-listener/Cargo.toml resolves.
+        # dtt-fork uses include_str!("../README.md") so .md files must
+        # survive filtering alongside normal Cargo sources.
         gossipListenerSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter =
@@ -45,8 +45,6 @@
                 || pkgs.lib.hasPrefix "dtt-fork/" rel
                 || rel == "gossip-listener"
                 || rel == "dtt-fork";
-              # dtt-fork uses include_str!("../README.md") so .md files
-              # must survive filtering alongside normal Cargo sources.
               isMarkdown = pkgs.lib.hasSuffix ".md" path;
             in
             inScope && ((craneLib.filterCargoSources path type) || isMarkdown);
@@ -71,17 +69,14 @@
 
           strictDeps = true;
 
-          # Point cargo at the correct manifest.
-          cargoExtraArgs = "--manifest-path gossip-listener/Cargo.toml";
-
-          # Crane places the vendored Cargo.lock at the source root during
-          # patchPhase, but cargo with --manifest-path looks for it next to
-          # the Cargo.toml.  Symlink it into the crate directory so both
-          # cargo and the git-source-replacement lockfile check are satisfied.
-          preBuild = ''
-            if [ -f Cargo.lock ] && [ ! -f gossip-listener/Cargo.lock ]; then
-              ln -s "$(pwd)/Cargo.lock" gossip-listener/Cargo.lock
-            fi
+          # Move the source root into gossip-listener/ so Crane's hooks
+          # (build, check, install) find Cargo.toml at the root.
+          # The path dependency `../dtt-fork` still resolves because
+          # dtt-fork/ is a sibling directory one level up.
+          # See: https://crane.dev/faq/workspace-not-at-source-root.html
+          postUnpack = ''
+            cd $sourceRoot/gossip-listener
+            sourceRoot="."
           '';
 
           nativeBuildInputs = with pkgs; [
@@ -105,16 +100,6 @@
           commonArgs
           // {
             inherit cargoArtifacts;
-
-            # Crane's default install hook runs cargo from the source root
-            # to discover binaries, but there is no Cargo.toml at the root.
-            # Install the binary directly from the build target directory.
-            installPhaseCommand = ''
-              mkdir -p $out/bin
-              install -m755 \
-                target/release/gossip-listener \
-                $out/bin/gossip-listener
-            '';
           }
         );
       in
