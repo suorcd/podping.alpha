@@ -31,10 +31,20 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Only the gossip-listener source
+        # gossip-listener plus local path dependency (dtt-fork)
         gossipListenerSrc = pkgs.lib.cleanSourceWith {
-          src = ./gossip-listener;
-          filter = path: type: (craneLib.filterCargoSources path type);
+          src = ./.;
+          filter =
+            path: type:
+            let
+              rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+              inScope =
+                pkgs.lib.hasPrefix "gossip-listener/" rel
+                || pkgs.lib.hasPrefix "dtt-fork/" rel
+                || rel == "gossip-listener"
+                || rel == "dtt-fork";
+            in
+            inScope && (craneLib.filterCargoSources path type);
         };
 
         commonArgs = {
