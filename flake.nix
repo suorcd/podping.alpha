@@ -31,7 +31,9 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # gossip-listener plus local path dependency (dtt-fork)
+        # Include gossip-listener and dtt-fork (local path dependency).
+        # The source root stays at the repo level so that the relative
+        # path `../dtt-fork` in gossip-listener/Cargo.toml resolves.
         gossipListenerSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter =
@@ -47,14 +49,27 @@
             inScope && (craneLib.filterCargoSources path type);
         };
 
+        # Vendor all dependencies (including the iroh-gossip git dep)
+        # from the gossip-listener lockfile.
+        cargoVendorDir = craneLib.vendorCargoDeps {
+          src = gossipListenerSrc;
+          cargoLock = ./gossip-listener/Cargo.lock;
+          cargoToml = ./gossip-listener/Cargo.toml;
+        };
+
         commonArgs = {
           src = gossipListenerSrc;
+          inherit cargoVendorDir;
+
+          # Crane needs these to locate the manifest and lockfile since
+          # they are not at the source root.
           cargoToml = ./gossip-listener/Cargo.toml;
           cargoLock = ./gossip-listener/Cargo.lock;
+
           strictDeps = true;
 
-          # Git dependencies cause lock file drift after vendoring
-          cargoExtraArgs = "--offline";
+          # Point cargo at the correct manifest.
+          cargoExtraArgs = "--manifest-path gossip-listener/Cargo.toml";
 
           nativeBuildInputs = with pkgs; [
             pkg-config
