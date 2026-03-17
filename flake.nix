@@ -71,6 +71,16 @@
           # Point cargo at the correct manifest.
           cargoExtraArgs = "--manifest-path gossip-listener/Cargo.toml";
 
+          # Crane places the vendored Cargo.lock at the source root during
+          # patchPhase, but cargo with --manifest-path looks for it next to
+          # the Cargo.toml.  Symlink it into the crate directory so both
+          # cargo and the git-source-replacement lockfile check are satisfied.
+          preBuild = ''
+            if [ -f Cargo.lock ] && [ ! -f gossip-listener/Cargo.lock ]; then
+              ln -s "$(pwd)/Cargo.lock" gossip-listener/Cargo.lock
+            fi
+          '';
+
           nativeBuildInputs = with pkgs; [
             pkg-config
           ];
