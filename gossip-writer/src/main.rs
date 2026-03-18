@@ -5,6 +5,7 @@ use iroh::protocol::Router;
 use iroh::SecretKey;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::api::Event;
+use distributed_topic_tracker::{GossipSender as DttGossipSender, GossipReceiver as DttGossipReceiver};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -166,6 +167,7 @@ const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 600;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const BATCH_INTERVAL_SECS: u64 = 3;
+const RECONNECT_AFTER_FAILURES: u64 = 5;
 
 // A pending IRI extracted from a ZMQ message, waiting to be batched
 struct PendingPing {
@@ -319,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dht_signing_key.verifying_key(),
         dht_signing_key,
         None,
-        dht_initial_secret.into_bytes(),
+        dht_initial_secret.clone().into_bytes(),
     );
 
     let topic = gossip
@@ -327,6 +329,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let (gossip_sender, gossip_receiver) = topic.split().await?;
     println!("  Joined gossip topic with DHT auto-discovery.");
+
+    // Shared sender so watchdog and broadcast task can both use (and reconnect can replace) it
+    let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
+        Arc::new(tokio::sync::RwLock::new(gossip_sender));
 
     // --- Optionally join bootstrap peers ---
     let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
@@ -346,7 +352,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  No additional bootstrap peers configured.");
     } else {
         println!("  Joining {} bootstrap peers...", bootstrap_peers.len());
-        if let Err(e) = gossip_sender.join_peers(bootstrap_peers, None).await {
+        let sender = shared_sender.read().await;
+        if let Err(e) = sender.join_peers(bootstrap_peers, None).await {
             eprintln!("  Warning: failed to join bootstrap peers: {}", e);
         }
     }
@@ -355,12 +362,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
     let announce_tx = tx.clone();
 
-    // --- Async broadcast task ---
-    let broadcast_sender = gossip_sender.clone();
+    // --- Shutdown flag for the blocking ZMQ thread ---
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_zmq = shutdown.clone();
+
+    // --- Re-bootstrap watchdog timer ---
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
+
+    // Spawn the initial receive task
+    spawn_receive_task(
+        gossip_receiver,
+        peers_file.clone(),
+        my_node_id,
+        trusted_publishers.clone(),
+        trusted_publishers_file.clone(),
+        auto_trust_endorsements,
+        last_notification_time.clone(),
+    );
+
+    // --- Async broadcast task (with reconnection) ---
+    let broadcast_shared = shared_sender.clone();
+    let broadcast_shutdown = shutdown.clone();
+    let reconnect_gossip = gossip.clone();
+    let reconnect_node_key_bytes = node_key_bytes;
+    let reconnect_dht_secret = dht_initial_secret.clone();
+    let reconnect_peers_file = peers_file.clone();
+    let reconnect_my_node_id = my_node_id;
+    let reconnect_trusted = trusted_publishers.clone();
+    let reconnect_trusted_file = trusted_publishers_file.clone();
+    let reconnect_auto_trust = auto_trust_endorsements;
+    let reconnect_last_notif = last_notification_time.clone();
     tokio::spawn(async move {
+        let mut consecutive_failures: u64 = 0;
         while let Some(payload) = rx.recv().await {
-            if let Err(e) = broadcast_sender.broadcast(payload).await {
-                eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
+            if broadcast_shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let result = {
+                let sender = broadcast_shared.read().await;
+                sender.broadcast(payload.clone()).await
+            };
+            match result {
+                Ok(_) => {
+                    if consecutive_failures >= 3 {
+                        println!("\x1b[32m[BROADCAST] Gossip broadcast recovered after {} failures\x1b[0m", consecutive_failures);
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures <= 3 {
+                        eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
+                    } else if consecutive_failures == RECONNECT_AFTER_FAILURES {
+                        eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
+                        // Attempt to re-subscribe to the gossip topic
+                        let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
+                        let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
+                        let publisher = RecordPublisher::new(
+                            dtt_topic,
+                            dht_key.verifying_key(),
+                            dht_key,
+                            None,
+                            reconnect_dht_secret.clone().into_bytes(),
+                        );
+                        match reconnect_gossip
+                            .subscribe_and_join_with_auto_discovery_no_wait(publisher)
+                            .await
+                        {
+                            Ok(new_topic) => match new_topic.split().await {
+                                Ok((new_sender, new_receiver)) => {
+                                    // Replace the shared sender
+                                    {
+                                        let mut sender_guard = broadcast_shared.write().await;
+                                        *sender_guard = new_sender;
+                                    }
+
+                                    // Spawn a fresh receive task
+                                    spawn_receive_task(
+                                        new_receiver,
+                                        reconnect_peers_file.clone(),
+                                        reconnect_my_node_id,
+                                        reconnect_trusted.clone(),
+                                        reconnect_trusted_file.clone(),
+                                        reconnect_auto_trust,
+                                        reconnect_last_notif.clone(),
+                                    );
+
+                                    // Retry the failed payload on the new sender
+                                    let sender = broadcast_shared.read().await;
+                                    if let Err(e2) = sender.broadcast(payload).await {
+                                        eprintln!("\x1b[35m[WARN] Broadcast still failing after reconnect: {}\x1b[0m", e2);
+                                    } else {
+                                        consecutive_failures = 0;
+                                        println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
+                                    }
+                                }
+                                Err(e2) => {
+                                    eprintln!("\x1b[1;31m[RECONNECT] Failed to split topic: {}. Will retry.\x1b[0m", e2);
+                                    consecutive_failures = 0;
+                                }
+                            },
+                            Err(e2) => {
+                                eprintln!("\x1b[1;31m[RECONNECT] Failed to re-subscribe: {}. Will retry on next batch.\x1b[0m", e2);
+                                // Reset counter so it tries again after another N failures
+                                consecutive_failures = 0;
+                            }
+                        }
+                    }
+                    // Between 3 and RECONNECT_AFTER_FAILURES: suppress log spam
+                }
             }
         }
     });
@@ -428,12 +539,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Re-bootstrap watchdog: if no GossipNotification in 3 minutes, re-join peers ---
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
-
     {
         let watchdog_last = last_notification_time.clone();
-        let watchdog_sender = gossip_sender.clone();
+        let watchdog_shared = shared_sender.clone();
         let watchdog_peers_file = peers_file.clone();
         let watchdog_bootstrap_str = bootstrap_peer_ids_str.clone();
         tokio::spawn(async move {
@@ -460,7 +568,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("\x1b[33m[WATCHDOG] No known peers to re-bootstrap with\x1b[0m");
                     } else {
                         println!("\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m", peers.len());
-                        if let Err(e) = watchdog_sender.join_peers(peers, None).await {
+                        let sender = watchdog_shared.read().await;
+                        if let Err(e) = sender.join_peers(peers, None).await {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
                         }
                     }
@@ -469,120 +578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // --- Async receive task ---
-    let recv_peers_file = peers_file.clone();
-    let recv_my_node_id = my_node_id;
-    let recv_trusted = trusted_publishers.clone();
-    let recv_trusted_file = trusted_publishers_file.clone();
-    let recv_auto_trust = auto_trust_endorsements;
-    let recv_last_notif = last_notification_time.clone();
-    tokio::spawn(async move {
-        while let Some(event) = gossip_receiver.next().await {
-            match event {
-                Ok(Event::Received(msg)) => {
-                    // Try PeerAnnounce first
-                    if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
-                        if announce.msg_type == "peer_announce" {
-                            println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
-                            if let Ok(node_id) = announce.node_id.parse() {
-                                save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
-                            }
-                        } else if announce.msg_type == "peer_endorse" {
-                            if !recv_auto_trust {
-                                continue;
-                            }
-                            // Verify signature
-                            match announce.verify_endorse_signature() {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    eprintln!("\x1b[35m[WARN] PeerEndorse without signature, ignoring\x1b[0m");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    eprintln!("\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m");
-                                    continue;
-                                }
-                            }
-
-                            let sender = match &announce.sender {
-                                Some(s) => s.clone(),
-                                None => continue,
-                            };
-
-                            // Check if the endorser is trusted
-                            let is_trusted = {
-                                let tp = recv_trusted.read().unwrap();
-                                tp.contains(&sender)
-                            };
-
-                            if !is_trusted {
-                                println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", &sender[..8.min(sender.len())]);
-                                continue;
-                            }
-
-                            // Add endorsed keys
-                            if let Some(ref node_list) = announce.node_list {
-                                let mut added = 0;
-                                {
-                                    let mut tp = recv_trusted.write().unwrap();
-                                    for key in node_list {
-                                        if tp.insert(key.clone()) {
-                                            added += 1;
-                                            println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], &sender[..8.min(sender.len())]);
-                                        }
-                                    }
-                                }
-                                if added > 0 {
-                                    let tp = recv_trusted.read().unwrap();
-                                    save_trusted_publishers(&recv_trusted_file, &tp);
-                                    println!("\x1b[32m[ENDORSE] {} new keys added, {} total trusted publishers\x1b[0m", added, tp.len());
-                                }
-                            }
-                        }
-                    } else {
-                        // Fall back to GossipNotification
-                        match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
-                            Ok(notif) => {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                                recv_last_notif.store(now, Ordering::Relaxed);
-                                println!(
-                                    "\x1b[36m[GOSSIP] [{} IRIs] sender={} medium={} reason={}\x1b[0m",
-                                    notif.iris.len(),
-                                    &notif.sender[..8],
-                                    notif.medium,
-                                    notif.reason
-                                );
-                                for iri in notif.iris {
-                                    println!("\x1b[36m[GOSSIP]   > {}\x1b[0m", iri);
-                                }
-                            }
-                            Err(_) => {
-                                eprintln!("\x1b[35m[WARN] unknown message format ({} bytes)\x1b[0m", msg.content.len());
-                            }
-                        }
-                    }
-                }
-                Ok(Event::NeighborUp(node_id)) => {
-                    println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
-                    save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
-                }
-                Ok(Event::NeighborDown(node_id)) => {
-                    println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
-                }
-                Ok(Event::Lagged) => {
-                    eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
-                }
-                Err(e) => {
-                    eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // --- Shutdown flag for the blocking ZMQ thread ---
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_zmq = shutdown.clone();
+    // (receive task is spawned above via spawn_receive_task and re-spawned on reconnect)
 
     // --- ZMQ receive loop (blocking, runs in spawn_blocking) ---
     let zmq_bind_clone = zmq_bind.clone();
@@ -948,4 +944,130 @@ fn load_or_create_node_key(path: &str) -> Result<SecretKey, Box<dyn std::error::
         println!("  Generated new iroh node key -> {}", path);
         Ok(key)
     }
+}
+
+/// Spawn an async task that processes incoming gossip events (PeerAnnounce, PeerEndorse,
+/// GossipNotification, neighbor changes). Called on startup and again after reconnection.
+fn spawn_receive_task(
+    receiver: DttGossipReceiver,
+    peers_file: String,
+    my_node_id: iroh::EndpointId,
+    trusted_publishers: Arc<RwLock<HashSet<String>>>,
+    trusted_publishers_file: String,
+    auto_trust_endorsements: bool,
+    last_notification_time: Arc<AtomicU64>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = receiver.next().await {
+            match event {
+                Ok(Event::Received(msg)) => {
+                    // Try PeerAnnounce first
+                    if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
+                        if announce.msg_type == "peer_announce" {
+                            if let Some(ref name) = announce.friendly_name {
+                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m", name, announce.node_id, announce.version);
+                            } else {
+                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                            }
+                            if let Ok(node_id) = announce.node_id.parse() {
+                                save_peer_if_new(&peers_file, &node_id, &my_node_id);
+                            }
+                        } else if announce.msg_type == "peer_endorse" {
+                            if !auto_trust_endorsements {
+                                continue;
+                            }
+                            // Verify signature
+                            match announce.verify_endorse_signature() {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!("\x1b[35m[WARN] PeerEndorse without signature, ignoring\x1b[0m");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    eprintln!("\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m");
+                                    continue;
+                                }
+                            }
+
+                            let sender = match &announce.sender {
+                                Some(s) => s.clone(),
+                                None => continue,
+                            };
+
+                            let sender_display = match &announce.friendly_name {
+                                Some(name) => format!("\"{}\" ({})", name, &sender[..8.min(sender.len())]),
+                                None => sender[..8.min(sender.len())].to_string(),
+                            };
+
+                            // Check if the endorser is trusted
+                            let is_trusted = {
+                                let tp = trusted_publishers.read().unwrap();
+                                tp.contains(&sender)
+                            };
+
+                            if !is_trusted {
+                                println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", sender_display);
+                                continue;
+                            }
+
+                            // Add endorsed keys
+                            if let Some(ref node_list) = announce.node_list {
+                                let mut added = 0;
+                                {
+                                    let mut tp = trusted_publishers.write().unwrap();
+                                    for key in node_list {
+                                        if tp.insert(key.clone()) {
+                                            added += 1;
+                                            println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], sender_display);
+                                        }
+                                    }
+                                }
+                                if added > 0 {
+                                    let tp = trusted_publishers.read().unwrap();
+                                    save_trusted_publishers(&trusted_publishers_file, &tp);
+                                    println!("\x1b[32m[ENDORSE] {} new keys added, {} total trusted publishers\x1b[0m", added, tp.len());
+                                }
+                            }
+                        }
+                    } else {
+                        // Fall back to GossipNotification
+                        match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
+                            Ok(notif) => {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                last_notification_time.store(now, Ordering::Relaxed);
+                                println!(
+                                    "\x1b[36m[GOSSIP] [{} IRIs] sender={} medium={} reason={}\x1b[0m",
+                                    notif.iris.len(),
+                                    &notif.sender[..8],
+                                    notif.medium,
+                                    notif.reason
+                                );
+                                for iri in notif.iris {
+                                    println!("\x1b[36m[GOSSIP]   > {}\x1b[0m", iri);
+                                }
+                            }
+                            Err(_) => {
+                                eprintln!("\x1b[35m[WARN] unknown message format ({} bytes)\x1b[0m", msg.content.len());
+                            }
+                        }
+                    }
+                }
+                Ok(Event::NeighborUp(node_id)) => {
+                    println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
+                    save_peer_if_new(&peers_file, &node_id, &my_node_id);
+                }
+                Ok(Event::NeighborDown(node_id)) => {
+                    println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
+                }
+                Ok(Event::Lagged) => {
+                    eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);
+                    break;
+                }
+            }
+        }
+        println!("\x1b[33m[RECV] Gossip receive task ended.\x1b[0m");
+    });
 }
