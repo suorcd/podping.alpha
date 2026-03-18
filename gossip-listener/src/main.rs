@@ -1028,7 +1028,15 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             }
         }
         Event::NeighborUp(node_id) => {
-            println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
+            let node_str = node_id.to_string();
+            let display = {
+                let names = peer_names.read().unwrap();
+                match names.get(&node_str) {
+                    Some(name) => format!("\"{}\" ({})", name, node_id),
+                    None => node_str,
+                }
+            };
+            println!("\x1b[32m[EVENT] NeighborUp: {display}\x1b[0m");
             save_peer_if_new(peers_file, &node_id, my_node_id);
             // Forward to catch-up task if waiting (std::sync::Mutex is fine here:
             // lock held briefly, no .await while held, called from sync function)
@@ -1039,7 +1047,15 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             }
         }
         Event::NeighborDown(node_id) => {
-            println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
+            let node_str = node_id.to_string();
+            let display = {
+                let names = peer_names.read().unwrap();
+                match names.get(&node_str) {
+                    Some(name) => format!("\"{}\" ({})", name, node_id),
+                    None => node_str,
+                }
+            };
+            println!("\x1b[31m[EVENT] NeighborDown: {display}\x1b[0m");
         }
         Event::Lagged => {
             eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");

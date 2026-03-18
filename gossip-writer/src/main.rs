@@ -370,6 +370,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let last_notification_time = Arc::new(AtomicU64::new(now_secs));
 
+    // Peer friendly name tracking
+    let peer_names: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn the initial receive task
     spawn_receive_task(
         gossip_receiver,
@@ -379,6 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trusted_publishers_file.clone(),
         auto_trust_endorsements,
         last_notification_time.clone(),
+        peer_names.clone(),
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -393,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_trusted_file = trusted_publishers_file.clone();
     let reconnect_auto_trust = auto_trust_endorsements;
     let reconnect_last_notif = last_notification_time.clone();
+    let reconnect_peer_names = peer_names.clone();
     tokio::spawn(async move {
         let mut consecutive_failures: u64 = 0;
         while let Some(payload) = rx.recv().await {
@@ -447,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         reconnect_trusted_file.clone(),
                                         reconnect_auto_trust,
                                         reconnect_last_notif.clone(),
+                                        reconnect_peer_names.clone(),
                                     );
 
                                     // Retry the failed payload on the new sender
@@ -956,6 +962,7 @@ fn spawn_receive_task(
     trusted_publishers_file: String,
     auto_trust_endorsements: bool,
     last_notification_time: Arc<AtomicU64>,
+    peer_names: Arc<RwLock<HashMap<String, String>>>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
@@ -966,6 +973,8 @@ fn spawn_receive_task(
                         if announce.msg_type == "peer_announce" {
                             if let Some(ref name) = announce.friendly_name {
                                 println!("\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m", name, announce.node_id, announce.version);
+                                let mut names = peer_names.write().unwrap();
+                                names.insert(announce.node_id.clone(), name.clone());
                             } else {
                                 println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
                             }
@@ -1053,11 +1062,27 @@ fn spawn_receive_task(
                     }
                 }
                 Ok(Event::NeighborUp(node_id)) => {
-                    println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
+                    let node_str = node_id.to_string();
+                    let display = {
+                        let names = peer_names.read().unwrap();
+                        match names.get(&node_str) {
+                            Some(name) => format!("\"{}\" ({})", name, node_id),
+                            None => node_str,
+                        }
+                    };
+                    println!("\x1b[32m[EVENT] NeighborUp: {display}\x1b[0m");
                     save_peer_if_new(&peers_file, &node_id, &my_node_id);
                 }
                 Ok(Event::NeighborDown(node_id)) => {
-                    println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
+                    let node_str = node_id.to_string();
+                    let display = {
+                        let names = peer_names.read().unwrap();
+                        match names.get(&node_str) {
+                            Some(name) => format!("\"{}\" ({})", name, node_id),
+                            None => node_str,
+                        }
+                    };
+                    println!("\x1b[31m[EVENT] NeighborDown: {display}\x1b[0m");
                 }
                 Ok(Event::Lagged) => {
                     eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
