@@ -438,9 +438,12 @@ async fn main() -> anyhow::Result<()> {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let is_iroh = location.contains("iroh-quinn") || payload.contains("drained connections");
+        let is_actor_shutdown = payload.contains("actor stopped");
         if is_iroh {
             eprintln!("\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m", location, payload);
             eprintln!("\x1b[1;31m[PANIC] This is an upstream bug, not a gossip-listener issue. Process will restart via Docker.\x1b[0m");
+        } else if is_actor_shutdown {
+            eprintln!("\x1b[33m[SHUTDOWN] DTT actor stopped (normal during shutdown)\x1b[0m");
         } else {
             eprintln!("\x1b[1;31m[PANIC] at {}: {}\x1b[0m", location, payload);
             let bt = std::backtrace::Backtrace::force_capture();
