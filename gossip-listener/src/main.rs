@@ -1,4 +1,5 @@
 mod archive;
+mod sse;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -28,6 +29,8 @@ const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
+const DEFAULT_SSE_BIND_ADDR: &str = "0.0.0.0:8089";
+const DEFAULT_SSE_BUFFER_SIZE: usize = 1000;
 
 //Structs ------------------------------------------------------------------------------------------
 
@@ -285,6 +288,7 @@ async fn run_catchup(
     trusted_publishers: &Arc<RwLock<HashSet<String>>>,
     last_notification_time: &Arc<AtomicU64>,
     db: &Option<Arc<Mutex<archive::Archive>>>,
+    sse_tx: &Option<tokio::sync::broadcast::Sender<String>>,
 ) {
     println!("\x1b[36m[CATCHUP] Starting catch-up from {}s ago\x1b[0m",
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().saturating_sub(since));
@@ -391,7 +395,10 @@ async fn run_catchup(
             let tp = trusted_publishers.read().unwrap();
             if tp.is_empty() || tp.contains(&notif.sender) {
                 let sender_display = notif.sender[..8.min(notif.sender.len())].to_string();
-                print_notification(&notif, &sender_display);
+                let json = print_notification(&notif, &sender_display);
+                if let Some(ref tx) = sse_tx {
+                    let _ = tx.send(json);
+                }
                 if let Some(ref db_arc) = db {
                     let db_lock = db_arc.lock().unwrap();
                     match db_lock.store(
@@ -497,6 +504,21 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
 
+    let sse_enabled = env::var("SSE_ENABLED")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let sse_bind_addr: std::net::SocketAddr = env::var("SSE_BIND_ADDR")
+        .unwrap_or_else(|_| DEFAULT_SSE_BIND_ADDR.to_string())
+        .parse()
+        .unwrap_or_else(|e| {
+            eprintln!("\x1b[35m[WARN] Invalid SSE_BIND_ADDR, using default: {}\x1b[0m", e);
+            DEFAULT_SSE_BIND_ADDR.parse().unwrap()
+        });
+    let sse_buffer_size: usize = env::var("SSE_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SSE_BUFFER_SIZE);
+
     let friendly_name: Option<String> = env::var("NODE_FRIENDLY_NAME")
         .ok()
         .map(|s| s.trim().to_string())
@@ -514,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  DHT discovery: enabled");
     println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
     println!("  Catch-up:     {}", if catchup_enabled { "enabled" } else { "disabled" });
+    println!("  SSE:          {}", if sse_enabled { format!("{}", sse_bind_addr) } else { "disabled".to_string() });
     if let Some(ref name) = friendly_name {
         println!("  Friendly name: {}", name);
     }
@@ -526,6 +549,13 @@ async fn main() -> anyhow::Result<()> {
             println!("  Trusted publisher filter: {} senders", tp.len());
         }
     }
+
+    // Start SSE server if enabled
+    let sse_tx: Option<tokio::sync::broadcast::Sender<String>> = if sse_enabled {
+        Some(sse::start_sse_server(sse_bind_addr, sse_buffer_size))
+    } else {
+        None
+    };
 
     //Set up Iroh context
     let node_key = load_or_create_node_key(&node_key_file)?;
@@ -753,6 +783,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_last_notif = last_notification_time.clone();
         let reconnect_peer_names = peer_names.clone();
         let reconnect_db = db.clone();
+        let reconnect_sse_tx = sse_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -792,6 +823,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_last_notif.clone(),
                                     reconnect_db.clone(),
                                     reconnect_peer_names.clone(),
+                                    reconnect_sse_tx.clone(),
                                 );
 
                                 println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
@@ -823,6 +855,7 @@ async fn main() -> anyhow::Result<()> {
         let catchup_trusted = trusted_publishers.clone();
         let catchup_last = last_notification_time.clone();
         let catchup_db = db.clone();
+        let catchup_sse_tx = sse_tx.clone();
 
         let since = if let Some(ref db_arc) = db {
             let db_lock = db_arc.lock().unwrap();
@@ -850,6 +883,7 @@ async fn main() -> anyhow::Result<()> {
                 &catchup_trusted,
                 &catchup_last,
                 &catchup_db,
+                &catchup_sse_tx,
             ).await;
         });
 
@@ -866,7 +900,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event, &recv_peer_names),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event, &recv_peer_names, &sse_tx),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -887,7 +921,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -1004,7 +1038,10 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                                     None => notif.sender[..8.min(notif.sender.len())].to_string(),
                                 }
                             };
-                            print_notification(&notif, &sender_display);
+                            let json = print_notification(&notif, &sender_display);
+                            if let Some(ref tx) = sse_tx {
+                                let _ = tx.send(json);
+                            }
                             if let Some(ref db_arc) = db {
                                 let db_lock = db_arc.lock().unwrap();
                                 match db_lock.store(
@@ -1068,7 +1105,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
 }
 
 //Pretty print messages
-fn print_notification(notif: &GossipNotification, sender_display: &str) {
+fn print_notification(notif: &GossipNotification, sender_display: &str) -> String {
     let sig_status = match notif.verify_signature() {
         Ok(true) => "VALID",
         Ok(false) => "UNSIGNED",
@@ -1080,7 +1117,9 @@ fn print_notification(notif: &GossipNotification, sender_display: &str) {
         obj.insert("sig_status".to_string(), serde_json::Value::String(sig_status.to_string()));
         obj.insert("sender_name".to_string(), serde_json::Value::String(sender_display.to_string()));
     }
-    println!("PODPING: [{}]", serde_json::to_string(&json).unwrap_or_default());
+    let json_string = serde_json::to_string(&json).unwrap_or_default();
+    println!("PODPING: [{}]", json_string);
+    json_string
 }
 
 // Sanitize a friendly name received from a remote peer: strip control chars, limit to 64 chars
@@ -1240,6 +1279,7 @@ fn spawn_receive_task(
     last_notification_time: Arc<AtomicU64>,
     db: Option<Arc<Mutex<archive::Archive>>>,
     peer_names: Arc<RwLock<HashMap<String, String>>>,
+    sse_tx: Option<tokio::sync::broadcast::Sender<String>>,
 ) {
     // Neighbor forwarding is not available on reconnect (catch-up is a startup-only feature)
     let neighbor_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>> =
@@ -1258,6 +1298,7 @@ fn spawn_receive_task(
                     &db,
                     &neighbor_tx,
                     &peer_names,
+                    &sse_tx,
                 ),
                 Err(e) => {
                     eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);

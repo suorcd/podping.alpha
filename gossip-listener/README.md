@@ -118,6 +118,9 @@ All configuration is via environment variables. Every variable is optional.
 | `NODE_FRIENDLY_NAME` | *(none)* | Optional human-readable node name (max 64 chars), broadcast in PeerAnnounce/PeerEndorse |
 | `PEER_ANNOUNCE_INTERVAL` | `300` | Seconds between broadcasting `PeerAnnounce` messages |
 | `PEER_ENDORSE_INTERVAL` | `45` | Seconds between broadcasting `PeerEndorse` messages |
+| `SSE_ENABLED` | `false` | Enable the Server-Sent Events HTTP endpoint (`true`, `1`, or `yes`) |
+| `SSE_BIND_ADDR` | `0.0.0.0:8089` | Address and port for the SSE server |
+| `SSE_BUFFER_SIZE` | `1000` | Broadcast channel capacity for SSE clients |
 
 ## Output format
 
@@ -128,6 +131,52 @@ PODPING: [{"version":"1.1","sender":"ab12...","timestamp":1709827200,"medium":"p
 ```
 
 The `sig_status` field is one of `VALID`, `UNSIGNED`, or `INVALID`.
+
+## SSE (Server-Sent Events)
+
+When `SSE_ENABLED=true`, the listener runs an HTTP server that streams podping notifications as Server-Sent Events. External applications can subscribe to receive notifications in real-time.
+
+**Endpoints:**
+
+| Route | Description |
+|-------|-------------|
+| `GET /` | Health check — returns `gossip-listener SSE v{version}` |
+| `GET /events` | SSE stream of podping notifications |
+
+**Query filters on `/events` (all optional, AND'd):**
+
+| Param | Example | Description |
+|-------|---------|-------------|
+| `medium` | `podcast` | Only notifications with this medium |
+| `reason` | `update` | Only notifications with this reason |
+| `sender` | `abcd1234` | Only notifications from senders whose pubkey starts with this prefix |
+
+**Example:**
+
+```sh
+# Stream all notifications
+curl -N http://localhost:8089/events
+
+# Stream only podcast updates
+curl -N "http://localhost:8089/events?medium=podcast&reason=update"
+```
+
+Each event is delivered as:
+
+```
+event: podping
+data: {"version":"1.0","sender":"abcd1234...","medium":"podcast","reason":"update","iris":[...],"sig_status":"VALID","sender_name":"..."}
+```
+
+JavaScript clients can use `EventSource`:
+
+```js
+const es = new EventSource("http://localhost:8089/events?medium=podcast");
+es.addEventListener("podping", (e) => {
+  const notification = JSON.parse(e.data);
+  console.log(notification.iris);
+});
+```
 
 ## Trusted publisher filtering
 
