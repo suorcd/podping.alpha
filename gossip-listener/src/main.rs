@@ -612,6 +612,7 @@ async fn main() -> anyhow::Result<()> {
     let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
         Arc::new(tokio::sync::RwLock::new(gossip_sender));
     let broadcast_failures = Arc::new(AtomicU64::new(0));
+    let notifications_received = Arc::new(AtomicU64::new(0));
 
     //Joining peers from the known peers file serves as fallback/insurance if DHT no work
     let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
@@ -784,6 +785,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_peer_names = peer_names.clone();
         let reconnect_db = db.clone();
         let reconnect_sse_tx = sse_tx.clone();
+        let reconnect_notif_count = notifications_received.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -824,6 +826,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_db.clone(),
                                     reconnect_peer_names.clone(),
                                     reconnect_sse_tx.clone(),
+                                    reconnect_notif_count.clone(),
                                 );
 
                                 println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
@@ -839,6 +842,43 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // --- Periodic health report ---
+    {
+        let h_notifs = notifications_received.clone();
+        let h_failures = broadcast_failures.clone();
+        let h_last_notif = last_notification_time.clone();
+        tokio::spawn(async move {
+            let mut prev_notifs: u64 = 0;
+            let mut prev_failures: u64 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let notifs = h_notifs.load(Ordering::Relaxed);
+                let failures = h_failures.load(Ordering::Relaxed);
+                let last_notif = h_last_notif.load(Ordering::Relaxed);
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let since_last = now.saturating_sub(last_notif);
+                let delta_notifs = notifs - prev_notifs;
+                let delta_failures = failures.saturating_sub(prev_failures);
+
+                let status = if since_last > REBOOTSTRAP_TIMEOUT {
+                    "\x1b[1;31mSTALLED\x1b[0m"
+                } else if delta_failures > 0 {
+                    "\x1b[33mDEGRADED\x1b[0m"
+                } else {
+                    "\x1b[32mOK\x1b[0m"
+                };
+
+                println!(
+                    "\x1b[90m[HEALTH] {} | recv={} | bcast_failures={} | last_notif={}s ago\x1b[0m",
+                    status, delta_notifs, delta_failures, since_last,
+                );
+
+                prev_notifs = notifs;
+                prev_failures = failures;
             }
         });
     }
@@ -900,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event, &recv_peer_names, &sse_tx),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db, &neighbor_tx_for_event, &recv_peer_names, &sse_tx, &notifications_received),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -921,7 +961,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>, notifications_received: &Arc<AtomicU64>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -1029,6 +1069,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                     Ok(notif) => {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                         last_notification_time.store(now, Ordering::Relaxed);
+                        notifications_received.fetch_add(1, Ordering::Relaxed);
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
                             let sender_display = {
@@ -1280,6 +1321,7 @@ fn spawn_receive_task(
     db: Option<Arc<Mutex<archive::Archive>>>,
     peer_names: Arc<RwLock<HashMap<String, String>>>,
     sse_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    notifications_received: Arc<AtomicU64>,
 ) {
     // Neighbor forwarding is not available on reconnect (catch-up is a startup-only feature)
     let neighbor_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>> =
@@ -1299,6 +1341,7 @@ fn spawn_receive_task(
                     &neighbor_tx,
                     &peer_names,
                     &sse_tx,
+                    &notifications_received,
                 ),
                 Err(e) => {
                     eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);
