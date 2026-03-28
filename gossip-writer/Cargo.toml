@@ -1,6 +1,6 @@
 [package]
 name = "gossip-writer"
-version = "0.2.9"
+version = "0.3.0"
 authors = ["Dave Jones"]
 edition = "2021"
 build = "build.rs"
@@ -40,3 +40,6 @@ tokio = { version = "1", features = ["full"] }
 # Utilities
 hex = "0.4"
 bytes = "1"
+
+[patch.crates-io]
+distributed-topic-tracker = { path = "../dtt-fork" }

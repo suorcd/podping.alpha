@@ -99,12 +99,9 @@ impl Actor<anyhow::Error> for DhtActor {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    break;
-                }
+                else => break Ok(()),
             }
         }
-        Err(anyhow::anyhow!("actor stopped"))
     }
 }
 

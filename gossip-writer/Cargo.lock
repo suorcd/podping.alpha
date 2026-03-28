@@ -790,8 +790,6 @@ dependencies = [
 [[package]]
 name = "distributed-topic-tracker"
 version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42d94886a7440a10a01bed64bfe045a3b67fc3bffca6c48745d7403ecf052bb2"
 dependencies = [
  "actor-helper",
  "anyhow",
@@ -1296,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-writer"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "bytes",

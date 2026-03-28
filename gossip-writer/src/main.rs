@@ -779,9 +779,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Signal the ZMQ thread to exit, then wait for it
     shutdown.store(true, Ordering::Relaxed);
-    let _ = zmq_handle.await;
 
-    endpoint.close().await;
+    // Hard shutdown timeout — if graceful shutdown doesn't complete, force exit
+    let shutdown_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(shutdown_deadline);
+
+    tokio::select! {
+        _ = async {
+            let _ = zmq_handle.await;
+            endpoint.close().await;
+        } => {
+            println!("[info] Clean shutdown complete.");
+        }
+        _ = &mut shutdown_deadline => {
+            eprintln!("\x1b[33m[SHUTDOWN] Graceful shutdown timed out after 5s, forcing exit.\x1b[0m");
+            std::process::exit(0);
+        }
+    }
 
     Ok(())
 }
@@ -866,13 +880,17 @@ fn flush_batch(
             }
         }
 
-        match tx.blocking_send(signed_payload) {
+        match tx.try_send(signed_payload) {
             Ok(_) => {
                 println!(
                     "\x1b[32m[BATCH] Broadcast {} IRIs (medium={} reason={})\x1b[0m",
                     iri_count, medium_str, reason_str
                 );
                 broadcast_ok = true;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                eprintln!("\x1b[1;31m[WARN]  Broadcast queue full — dropping batch. Gossip sender may be stalled.\x1b[0m");
+                broadcast_ok = true; // still send ZMQ replies so front-end doesn't stall
             }
             Err(e) => {
                 eprintln!("\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m", e);
