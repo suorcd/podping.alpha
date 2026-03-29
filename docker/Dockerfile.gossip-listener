@@ -1,29 +1,28 @@
-# Switch to the standard Alpine base image
-FROM alpine:latest
+FROM debian:trixie-slim
 
-# Docker Buildx automatically populates these variables
-ARG TARGETARCH
-ARG TARGETVARIANT
+ARG TARGETPLATFORM
 
+RUN apt-get update \
+    && apt-get install -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /data
 WORKDIR /app
 
-# Copy all the downloaded artifacts from the GitHub Actions runner
 COPY artifacts /tmp/artifacts
 
-# apk is Alpine's package manager (replacing apt-get)
-# We install ca-certificates for web requests, and gcompat to run the glibc binaries
-RUN apk update && \
-    apk add --no-cache ca-certificates gcompat && \
-    if [ "$TARGETARCH" = "amd64" ]; then \
-      cp /tmp/artifacts/x86_64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener; \
-    elif [ "$TARGETARCH" = "arm64" ]; then \
-      cp /tmp/artifacts/aarch64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener; \
-    elif [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
-      cp /tmp/artifacts/armv7-unknown-linux-gnueabihf-binary/gossip-listener /app/gossip-listener; \
-    else \
-      echo "Unsupported architecture: $TARGETARCH$TARGETVARIANT" && exit 1; \
-    fi && \
-    chmod +x /app/gossip-listener && \
+RUN set -ex; \
+    case "$TARGETPLATFORM" in \
+        "linux/amd64") \
+            cp /tmp/artifacts/x86_64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
+        "linux/arm64") \
+            cp /tmp/artifacts/aarch64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
+        "linux/arm/v7") \
+            cp /tmp/artifacts/armv7-unknown-linux-gnueabihf-binary/gossip-listener /app/gossip-listener ;; \
+        *) \
+            echo "Unsupported platform: $TARGETPLATFORM"; exit 1 ;; \
+    esac; \
+    chmod +x /app/gossip-listener; \
     rm -rf /tmp/artifacts
 
-ENTRYPOINT ["/app/gossip-listener"]
+CMD ["/app/gossip-listener"]

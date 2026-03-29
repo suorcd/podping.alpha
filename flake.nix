@@ -31,15 +31,28 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Only the gossip-listener source
-        gossipListenerSrc = pkgs.lib.cleanSourceWith {
-          src = ./gossip-listener;
-          filter = path: type: (craneLib.filterCargoSources path type);
+        # Custom filter: Keep markdown files (for include_str!("README.md")) AND Cargo files
+        markdownFilter = path: _type: builtins.match ".*md$" path != null;
+        cargoOrMarkdown = path: type: (markdownFilter path type) || (craneLib.filterCargoSources path type);
+
+        # Include the entire repository source with the custom filter
+        workspaceSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = cargoOrMarkdown;
         };
 
         commonArgs = {
-          src = gossipListenerSrc;
+          src = workspaceSrc;
           strictDeps = true;
+
+          # Point crane to the nested Cargo configuration files
+          cargoToml = ./gossip-listener/Cargo.toml;
+          cargoLock = ./gossip-listener/Cargo.lock;
+
+          # Shift the build context into the gossip-listener folder after unpacking
+          postUnpack = ''
+            export sourceRoot=$sourceRoot/gossip-listener
+          '';
 
           # Git dependencies cause lock file drift after vendoring
           cargoExtraArgs = "--offline";
