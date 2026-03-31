@@ -915,13 +915,6 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         reconnect_dht_secret.clone().into_bytes(),
                     );
-                    // Shut down the old Gossip actor so its internal tasks stop
-                    {
-                        let old_gossip = reconnect_gossip_handle.read().await;
-                        if let Err(e) = old_gossip.shutdown().await {
-                            eprintln!("\x1b[35m[WARN] Failed to shut down old gossip actor: {}\x1b[0m", e);
-                        }
-                    }
                     // Spawn a fresh Gossip actor
                     let new_gossip = Gossip::builder()
                         .max_message_size(65536)

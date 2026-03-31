@@ -198,16 +198,8 @@ async fn reconnect_gossip_topic(
     endpoint: iroh::Endpoint,
     node_key_bytes: [u8; 32],
     dht_initial_secret: String,
-    old_gossip: Option<&Gossip>,
 ) -> Result<(DttGossipSender, DttGossipReceiver, Router, Gossip), Box<dyn std::error::Error + Send + Sync>>
 {
-    // Shut down the old Gossip actor so its internal tasks stop
-    if let Some(old) = old_gossip {
-        if let Err(e) = old.shutdown().await {
-            eprintln!("\x1b[35m[WARN] Failed to shut down old gossip actor: {}\x1b[0m", e);
-        }
-    }
-
     let dht_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
     let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
     let publisher = RecordPublisher::new(
@@ -540,21 +532,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     eprintln!("\x1b[1;31m[RECONNECT] Watchdog requested full reconnect after repeated stalls...\x1b[0m");
-                    let old_gossip = bcast_gossip_handle.read().await;
                     match reconnect_gossip_topic(
                         reconnect_endpoint.clone(),
                         reconnect_node_key_bytes,
                         reconnect_dht_secret.clone(),
-                        Some(&*old_gossip),
                     ).await {
                         Ok((new_sender, new_receiver, new_router, new_gossip)) => {
-                            drop(old_gossip);
                             _current_router = new_router;
                             {
                                 let mut sender_guard = broadcast_shared.write().await;
                                 *sender_guard = new_sender;
                             }
                             {
+                                // Replacing the old Gossip drops its last strong reference,
+                                // which aborts the old actor task via AbortOnDropHandle
                                 let mut gossip_guard = bcast_gossip_handle.write().await;
                                 *gossip_guard = new_gossip;
                             }
@@ -641,15 +632,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Reconnect if enough consecutive failures
                     if consecutive_failures == RECONNECT_AFTER_FAILURES {
                         eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
-                        let old_gossip = bcast_gossip_handle.read().await;
                         match reconnect_gossip_topic(
                             reconnect_endpoint.clone(),
                             reconnect_node_key_bytes,
                             reconnect_dht_secret.clone(),
-                            Some(&*old_gossip),
                         ).await {
                             Ok((new_sender, new_receiver, new_router, new_gossip)) => {
-                                drop(old_gossip);
                                 _current_router = new_router;
                                 {
                                     let mut sender_guard = broadcast_shared.write().await;
