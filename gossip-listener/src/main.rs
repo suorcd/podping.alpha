@@ -639,6 +639,9 @@ async fn main() -> anyhow::Result<()> {
     // Shared sender so all tasks use the same sender (and reconnect can replace it)
     let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
         Arc::new(tokio::sync::RwLock::new(gossip_sender));
+    // Track the current Gossip actor so reconnect can shut down the old one
+    let shared_gossip: Arc<tokio::sync::RwLock<Gossip>> =
+        Arc::new(tokio::sync::RwLock::new(gossip));
     let broadcast_failures = Arc::new(AtomicU64::new(0));
     let notifications_received = Arc::new(AtomicU64::new(0));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -872,6 +875,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_requested = reconnect_requested.clone();
         let reconnect_notify = reconnect_notify.clone();
         let reconnect_shared = shared_sender.clone();
+        let reconnect_gossip_handle = shared_gossip.clone();
         let reconnect_endpoint = endpoint.clone();
         let reconnect_node_key_bytes = node_key_bytes;
         let reconnect_dht_secret = dht_initial_secret.clone();
@@ -911,7 +915,14 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         reconnect_dht_secret.clone().into_bytes(),
                     );
-                    // Spawn a fresh Gossip actor (the old one is dead after all topics quit)
+                    // Shut down the old Gossip actor so its internal tasks stop
+                    {
+                        let old_gossip = reconnect_gossip_handle.read().await;
+                        if let Err(e) = old_gossip.shutdown().await {
+                            eprintln!("\x1b[35m[WARN] Failed to shut down old gossip actor: {}\x1b[0m", e);
+                        }
+                    }
+                    // Spawn a fresh Gossip actor
                     let new_gossip = Gossip::builder()
                         .max_message_size(65536)
                         .spawn(reconnect_endpoint.clone());
@@ -931,10 +942,14 @@ async fn main() -> anyhow::Result<()> {
                     {
                         Ok(new_topic) => match new_topic.split().await {
                             Ok((new_sender, new_receiver)) => {
-                                // Replace the shared sender
+                                // Replace the shared sender and gossip handle
                                 {
                                     let mut sender_guard = reconnect_shared.write().await;
                                     *sender_guard = new_sender;
+                                }
+                                {
+                                    let mut gossip_guard = reconnect_gossip_handle.write().await;
+                                    *gossip_guard = new_gossip.clone();
                                 }
                                 reconnect_failures.store(0, Ordering::Relaxed);
 
