@@ -56,6 +56,12 @@ struct PeerAnnounce {
     signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     friendly_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_percent: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_count: Option<u32>,
 }
 
 // Canonical form for peer_endorse signing (alphabetical by serialized key name)
@@ -78,6 +84,7 @@ impl PeerAnnounce {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let (cpu_percent, memory_mb, thread_count) = Self::gather_metrics();
         Self {
             msg_type: "peer_announce".to_string(),
             node_id: node_id.to_string(),
@@ -87,6 +94,9 @@ impl PeerAnnounce {
             node_list: None,
             signature: None,
             friendly_name,
+            cpu_percent,
+            memory_mb,
+            thread_count,
         }
     }
 
@@ -110,7 +120,55 @@ impl PeerAnnounce {
             node_list: Some(endorsed_keys),
             signature: None,
             friendly_name,
+            cpu_percent: None,
+            memory_mb: None,
+            thread_count: None,
         }
+    }
+
+    /// Read CPU usage, RSS memory, and thread count from /proc/self.
+    fn gather_metrics() -> (Option<f32>, Option<u64>, Option<u32>) {
+        let thread_count = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Threads:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u32>().ok())
+            });
+
+        let memory_mb = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|kb| kb / 1024)
+            });
+
+        let cpu_percent = (|| {
+            let stat = fs::read_to_string("/proc/self/stat").ok()?;
+            let fields: Vec<&str> = stat.rsplit(')').next()?.split_whitespace().collect();
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            let total_ticks = utime + stime;
+
+            let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
+            let uptime_secs: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
+
+            let start_time: u64 = fields.get(19)?.parse().ok()?;
+            let ticks_per_sec: u64 = 100;
+            let process_secs = uptime_secs - (start_time as f64 / ticks_per_sec as f64);
+
+            if process_secs > 0.0 {
+                Some((total_ticks as f64 / ticks_per_sec as f64 / process_secs * 100.0) as f32)
+            } else {
+                None
+            }
+        })();
+
+        (cpu_percent, memory_mb, thread_count)
     }
 
     fn canonical_endorse_bytes(&self) -> Vec<u8> {
@@ -1463,17 +1521,21 @@ fn spawn_receive_task(
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
+                            let metrics_str = match (announce.cpu_percent, announce.memory_mb, announce.thread_count) {
+                                (Some(cpu), Some(mem), Some(thr)) => format!(" [cpu={:.1}% mem={}MB thr={}]", cpu, mem, thr),
+                                _ => String::new(),
+                            };
                             if let Some(ref name) = announce.friendly_name {
                                 println!(
-                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m",
-                                    name, announce.node_id, announce.version
+                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}{}\x1b[0m",
+                                    name, announce.node_id, announce.version, metrics_str
                                 );
                                 let mut names = peer_names.write().unwrap();
                                 names.insert(announce.node_id.clone(), name.clone());
                             } else {
                                 println!(
-                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m",
-                                    announce.node_id, announce.version
+                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}{}\x1b[0m",
+                                    announce.node_id, announce.version, metrics_str
                                 );
                             }
                             if let Ok(node_id) = announce.node_id.parse() {
