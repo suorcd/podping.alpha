@@ -17,7 +17,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::signal;
@@ -62,6 +62,32 @@ struct PeerAnnounce {
     memory_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neighbor_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uptime_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    msgs_received: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    msgs_sent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_msg_age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconnect_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_type: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct AnnounceMetrics {
+    neighbor_count: Option<u32>,
+    uptime_secs: Option<u64>,
+    msgs_received: Option<u64>,
+    msgs_sent: Option<u64>,
+    last_msg_age_secs: Option<u64>,
+    reconnect_count: Option<u64>,
 }
 
 // Canonical form for peer_endorse signing (alphabetical by serialized key name)
@@ -79,7 +105,7 @@ struct CanonicalPeerEndorse<'a> {
 }
 
 impl PeerAnnounce {
-    fn new(node_id: &str, version: &str, friendly_name: Option<String>) -> Self {
+    fn new(node_id: &str, version: &str, friendly_name: Option<String>, metrics: AnnounceMetrics) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -97,6 +123,14 @@ impl PeerAnnounce {
             cpu_percent,
             memory_mb,
             thread_count,
+            neighbor_count: metrics.neighbor_count,
+            uptime_secs: metrics.uptime_secs,
+            msgs_received: metrics.msgs_received,
+            msgs_sent: metrics.msgs_sent,
+            last_msg_age_secs: metrics.last_msg_age_secs,
+            reconnect_count: metrics.reconnect_count,
+            os: Some(std::env::consts::OS.to_string()),
+            build_type: Some(if cfg!(debug_assertions) { "debug" } else { "release" }.to_string()),
         }
     }
 
@@ -123,6 +157,14 @@ impl PeerAnnounce {
             cpu_percent: None,
             memory_mb: None,
             thread_count: None,
+            neighbor_count: None,
+            uptime_secs: None,
+            msgs_received: None,
+            msgs_sent: None,
+            last_msg_age_secs: None,
+            reconnect_count: None,
+            os: None,
+            build_type: None,
         }
     }
 
@@ -538,6 +580,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_broadcasts_failed = Arc::new(AtomicU64::new(0));
     let health_last_broadcast_ok = Arc::new(AtomicU64::new(now_secs));
     let health_broadcast_task_alive = Arc::new(AtomicBool::new(true));
+    let reconnect_count_counter = Arc::new(AtomicU64::new(0));
+    let msgs_received_counter = Arc::new(AtomicU64::new(0));
+    let neighbor_count = Arc::new(AtomicU32::new(0));
+    let start_instant = std::time::Instant::now();
 
     // Spawn the initial receive task
     spawn_receive_task(
@@ -555,6 +601,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receive_generation.clone(),
         initial_receive_generation,
         shutdown.clone(),
+        msgs_received_counter.clone(),
+        neighbor_count.clone(),
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -568,6 +616,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_reconnect_requested = reconnect_requested.clone();
     let bcast_reconnect_notify = reconnect_notify.clone();
     let bcast_gossip_handle = shared_gossip.clone();
+    let bcast_msgs_received = msgs_received_counter.clone();
+    let bcast_reconnect_counter = reconnect_count_counter.clone();
+    let bcast_neighbor_count = neighbor_count.clone();
     let reconnect_endpoint = endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
     let reconnect_dht_secret = dht_initial_secret.clone();
@@ -633,11 +684,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 reconnect_receive_generation.clone(),
                                 reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
                                 broadcast_shutdown.clone(),
+                                bcast_msgs_received.clone(),
+                                bcast_neighbor_count.clone(),
                             );
 
+                            // Reset neighbor count — fresh subscription starts with 0 neighbors
+                            bcast_neighbor_count.store(0, Ordering::Relaxed);
                             consecutive_failures = 0;
                             bcast_failure_count.store(0, Ordering::Relaxed);
                             last_reconnect = std::time::Instant::now();
+                            bcast_reconnect_counter.fetch_add(1, Ordering::Relaxed);
                             println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
                         }
                         Err(e) => {
@@ -743,7 +799,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     reconnect_receive_generation.clone(),
                                     reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
                                     broadcast_shutdown.clone(),
+                                    bcast_msgs_received.clone(),
+                                    bcast_neighbor_count.clone(),
                                 );
+
+                                bcast_neighbor_count.store(0, Ordering::Relaxed);
 
                                 // Drain retry queue through new sender
                                 let queued = retry_queue.len();
@@ -772,6 +832,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                                 bcast_last_ok.store(now, Ordering::Relaxed);
                                 last_reconnect = std::time::Instant::now();
+                            bcast_reconnect_counter.fetch_add(1, Ordering::Relaxed);
                             println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
                             }
                             Err(e) => {
@@ -792,13 +853,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if peer_announce_interval > 0 {
         let announce_node_id = my_node_id.to_string();
         let announce_friendly = friendly_name.clone();
+        let announce_sent = health_broadcasts_sent.clone();
+        let announce_recv = msgs_received_counter.clone();
+        let announce_last_notif = last_notification_time.clone();
+        let announce_reconnects = reconnect_count_counter.clone();
+        let announce_neighbors = neighbor_count.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
+                let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let last_notif = announce_last_notif.load(Ordering::Relaxed);
+                let metrics = AnnounceMetrics {
+                    neighbor_count: Some(announce_neighbors.load(Ordering::Relaxed)),
+                    uptime_secs: Some(start_instant.elapsed().as_secs()),
+                    msgs_received: Some(announce_recv.load(Ordering::Relaxed)),
+                    msgs_sent: Some(announce_sent.load(Ordering::Relaxed)),
+                    last_msg_age_secs: Some(now_secs.saturating_sub(last_notif)),
+                    reconnect_count: Some(announce_reconnects.load(Ordering::Relaxed)),
+                };
                 let announce = PeerAnnounce::new(
                     &announce_node_id,
                     env!("CARGO_PKG_VERSION"),
                     announce_friendly.clone(),
+                    metrics,
                 );
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
@@ -1505,6 +1582,8 @@ fn spawn_receive_task(
     receive_generation_counter: Arc<AtomicU64>,
     receive_generation: u64,
     shutdown: Arc<AtomicBool>,
+    msgs_received: Arc<AtomicU64>,
+    neighbor_count: Arc<AtomicU32>,
 ) {
     tokio::spawn(async move {
         let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
@@ -1531,11 +1610,28 @@ fn spawn_receive_task(
                     // Any received message means gossip is alive — update watchdog timer
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                     last_notification_time.store(now, Ordering::Relaxed);
+                    msgs_received.fetch_add(1, Ordering::Relaxed);
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
                             let metrics_str = match (announce.cpu_percent, announce.memory_mb, announce.thread_count) {
-                                (Some(cpu), Some(mem), Some(thr)) => format!(" [cpu={:.1}% mem={}MB thr={}]", cpu, mem, thr),
+                                (Some(cpu), Some(mem), Some(thr)) => {
+                                    let mut s = format!(" [cpu={:.1}% mem={}MB thr={}", cpu, mem, thr);
+                                    if let Some(n) = announce.neighbor_count { s.push_str(&format!(" nbr={}", n)); }
+                                    if let Some(up) = announce.uptime_secs {
+                                        let hours = up / 3600;
+                                        let mins = (up % 3600) / 60;
+                                        s.push_str(&format!(" up={}h{}m", hours, mins));
+                                    }
+                                    if let Some(rx) = announce.msgs_received { s.push_str(&format!(" rx={}", rx)); }
+                                    if let Some(tx) = announce.msgs_sent { s.push_str(&format!(" tx={}", tx)); }
+                                    if let Some(age) = announce.last_msg_age_secs { s.push_str(&format!(" age={}s", age)); }
+                                    if let Some(rc) = announce.reconnect_count { s.push_str(&format!(" reconn={}", rc)); }
+                                    if let Some(ref os) = announce.os { s.push_str(&format!(" {}", os)); }
+                                    if let Some(ref bt) = announce.build_type { s.push_str(&format!("/{}", bt)); }
+                                    s.push(']');
+                                    s
+                                }
                                 _ => String::new(),
                             };
                             if let Some(ref name) = announce.friendly_name {
@@ -1642,6 +1738,7 @@ fn spawn_receive_task(
                     }
                 }
                 Ok(Event::NeighborUp(node_id)) => {
+                    neighbor_count.fetch_add(1, Ordering::Relaxed);
                     let node_str = node_id.to_string();
                     let display = {
                         let names = peer_names.read().unwrap();
@@ -1654,6 +1751,7 @@ fn spawn_receive_task(
                     save_peer_if_new(&peers_file, &node_id, &my_node_id);
                 }
                 Ok(Event::NeighborDown(node_id)) => {
+                    neighbor_count.fetch_sub(1, Ordering::Relaxed);
                     let node_str = node_id.to_string();
                     let display = {
                         let names = peer_names.read().unwrap();
