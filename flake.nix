@@ -1,5 +1,5 @@
 {
-  description = "Podping.alpha - gossip-listener";
+  description = "Podping.alpha - gossip-listener and gossip-writer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -19,7 +19,7 @@
       flake-utils,
       rust-overlay,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (
       system:
       let
         pkgs = import nixpkgs {
@@ -41,7 +41,7 @@
           filter = cargoOrMarkdown;
         };
 
-        commonArgs = {
+        gossipListenerCommonArgs = {
           src = workspaceSrc;
           strictDeps = true;
 
@@ -72,28 +72,74 @@
             ];
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        gossipWriterCommonArgs = {
+          src = workspaceSrc;
+          strictDeps = true;
+
+          cargoToml = ./gossip-writer/Cargo.toml;
+          cargoLock = ./gossip-writer/Cargo.lock;
+
+          postUnpack = ''
+            export sourceRoot=$sourceRoot/gossip-writer
+          '';
+
+          cargoExtraArgs = "--offline";
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+          ];
+
+          buildInputs = with pkgs; [
+            openssl
+            zeromq
+            capnproto
+          ];
+        };
+
+        gossipListenerCargoArtifacts = craneLib.buildDepsOnly gossipListenerCommonArgs;
+        gossipWriterCargoArtifacts = craneLib.buildDepsOnly gossipWriterCommonArgs;
 
         gossipListener = craneLib.buildPackage (
-          commonArgs
+          gossipListenerCommonArgs
           // {
-            inherit cargoArtifacts;
+            cargoArtifacts = gossipListenerCargoArtifacts;
+          }
+        );
+
+        gossipWriter = craneLib.buildPackage (
+          gossipWriterCommonArgs
+          // {
+            cargoArtifacts = gossipWriterCargoArtifacts;
           }
         );
       in
       {
         packages = {
           gossip-listener = gossipListener;
+          gossip-writer = gossipWriter;
           default = gossipListener;
         };
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = gossipListener;
-          name = "gossip-listener";
+        apps = {
+          default = flake-utils.lib.mkApp {
+            drv = gossipListener;
+            name = "gossip-listener";
+          };
+          gossip-listener = flake-utils.lib.mkApp {
+            drv = gossipListener;
+            name = "gossip-listener";
+          };
+          gossip-writer = flake-utils.lib.mkApp {
+            drv = gossipWriter;
+            name = "gossip-writer";
+          };
         };
 
         devShells.default = craneLib.devShell {
-          inputsFrom = [ gossipListener ];
+          inputsFrom = [
+            gossipListener
+            gossipWriter
+          ];
 
           packages = with pkgs; [
             cargo-watch
