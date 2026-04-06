@@ -9,40 +9,39 @@ This alpha version is a work in progress.  It is currently in an exploration pha
 version is to wireframe the p2p gossip writer and corresponding front-end support.
 
 ## Testing
-At this point on the development just launching the `gossip-listener` will help with the testing.
+At this point on the development just running the `gossip-listener` will help with the testing.
 
 Setting `ARCHIVE_ENABLED` to `1`, `yes` or `true` could be a second step, but this could fill up your hard disk.
 
-### Set-up
+Check the [gossip-listener documentation](gossip-listener/README.md) for all the info.
+
+### Quick set-up
 ```shell
 git clone https://github.com/Podcastindex-org/podping.alpha.git && cd "$(basename "$_" .git)"
 cd gossip-listener
 cargo build
 NODE_FRIENDLY_NAME='IDENTIFICADOR_AMIGABLE' cargo run
 ```
+### Update
+- Go to the `podping.alpha` directory.
+- Run `git pull`, discard or merge any local changes.
+- Same as the [Quick set-up](#quick-set-up) without the `git clone ...`.
 
 #### Dependencies
 You need `rust` in order to run/compile this tool.
 - In [ArchLinux](https://wiki.archlinux.org/title/Rust) you can just install `rust` or `rustup` (recommended if you intend to do development) with : `pacman -S rust`
+- In [debian](https://wiki.debian.org/Rust) install `build-essential` AND `cargo` or `rustup`. Execute `rustup default stable` if you choose `rustup`.
 
 ### Configuration
-* You can change these ENV variables:
+* You can change these ENV [variables](gossip-listener#configuration):
   * `ZMQ_BIND_ADDR`
   * `IROH_SECRET_FILE`
-  * `IROH_NODE_KEY_FILE`
   * `ARCHIVE_PATH`
-  * `KNOWN_PEERS_FILE`
-  * `BOOTSTRAP_PEER_IDS`
-  * `PEER_ANNOUNCE_INTERVAL`
-  * `DHT_INITIAL_SECRET`
-  * `TRUSTED_PUBLISHERS_FILE`
-  * `PEER_ENDORSE_INTERVAL`
   * `AUTO_TRUST_ENDORSEMENTS`
-  * `ARCHIVE_ENABLED`
-  * `NODE_FRIENDLY_NAME` to advertise a more friendly id.
+  * `ARCHIVE_ENABLED` - Stores all the podpings from the topic in a SQLite database. If another listener has been offline and wants to "catch up" it can start with `CATCHUP_ENABLED=true` and it will search the swarm for an `ARCHIVE_ENABLED=true` listener to back-fill from.
 
 ### Known Issues
-* `gossip-listener` uses the port `6881` so you might get a warning if ussing a Bitorrent tracker like ktorrent. You can use the Bitorrent client anyway, but it's not recommended to have both programs running on the same machine while testing.
+* `gossip-listener` uses the port `6881` so you might get a warning if there is already running a Bitorrent tracker like ktorrent.
 
 <br>
 
