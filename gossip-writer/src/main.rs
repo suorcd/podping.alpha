@@ -287,6 +287,7 @@ const REJOIN_INTERVAL_SECS: u64 = 1800; // Re-join peers every 30 minutes to pre
 const BATCH_INTERVAL_SECS: u64 = 3;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
+const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3;
 const MAX_RETRY_QUEUE: usize = 500;
 const MAX_GOSSIP_PAYLOAD: usize = 60000; // Must stay under max_message_size (65536) with overhead
 const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
@@ -648,7 +649,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Keep the router alive in this task; on reconnect we replace it
         // (dropping the old router aborts its accept loop without closing the endpoint)
         let mut _current_router = router;
+        let mut _current_endpoint = reconnect_endpoint.clone();
         let mut consecutive_failures: u64 = 0;
+        let mut consecutive_reconnects: u32 = 0;
         let mut retry_queue: VecDeque<Vec<u8>> = VecDeque::new();
         let timeout_dur = std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS);
         let mut last_reconnect = std::time::Instant::now();
@@ -663,10 +666,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("\x1b[33m[RECONNECT] Skipping — reconnect cooldown active\x1b[0m");
                         continue;
                     }
-                    eprintln!("\x1b[1;31m[RECONNECT] Watchdog requested full reconnect after repeated stalls...\x1b[0m");
+                    consecutive_reconnects += 1;
+                    if consecutive_reconnects > ENDPOINT_RESET_AFTER_RECONNECTS {
+                        eprintln!(
+                            "\x1b[1;35m[RECONNECT] {} consecutive reconnects — creating fresh endpoint\x1b[0m",
+                            consecutive_reconnects
+                        );
+                        let node_key = iroh::SecretKey::from_bytes(&reconnect_node_key_bytes);
+                        if let Ok(new_ep) = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                            .secret_key(node_key)
+                            .bind()
+                            .await
+                        {
+                            let old_ep = _current_endpoint.clone();
+                            tokio::spawn(async move {
+                                tokio::time::timeout(std::time::Duration::from_secs(5), old_ep.close()).await.ok();
+                            });
+                            _current_endpoint = new_ep;
+                        }
+                    }
+                    eprintln!("\x1b[1;31m[RECONNECT] Watchdog requested full reconnect (attempt {})...\x1b[0m", consecutive_reconnects);
                     let old_gossip = bcast_gossip_handle.read().await;
                     match reconnect_gossip_topic(
-                        reconnect_endpoint.clone(),
+                        _current_endpoint.clone(),
                         reconnect_node_key_bytes,
                         reconnect_dht_secret.clone(),
                         &*old_gossip,
@@ -744,6 +766,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("\x1b[32m[BROADCAST] Gossip broadcast recovered after {} failures\x1b[0m", consecutive_failures);
                             }
                             consecutive_failures = 0;
+                            consecutive_reconnects = 0;
                             bcast_failure_count.store(0, Ordering::Relaxed);
                         }
                         Ok(Err(e)) => {
@@ -782,10 +805,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("\x1b[33m[RECONNECT] Skipping — reconnect cooldown active\x1b[0m");
                             continue;
                         }
-                        eprintln!("\x1b[1;31m[RECONNECT] {} broadcast failures — reconnecting gossip topic...\x1b[0m", RECONNECT_AFTER_FAILURES);
+                        consecutive_reconnects += 1;
+                        if consecutive_reconnects > ENDPOINT_RESET_AFTER_RECONNECTS {
+                            eprintln!(
+                                "\x1b[1;35m[RECONNECT] {} consecutive reconnects — creating fresh endpoint\x1b[0m",
+                                consecutive_reconnects
+                            );
+                            let node_key = iroh::SecretKey::from_bytes(&reconnect_node_key_bytes);
+                            if let Ok(new_ep) = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                                .secret_key(node_key)
+                                .bind()
+                                .await
+                            {
+                                let old_ep = _current_endpoint.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::timeout(std::time::Duration::from_secs(5), old_ep.close()).await.ok();
+                                });
+                                _current_endpoint = new_ep;
+                            }
+                        }
+                        eprintln!("\x1b[1;31m[RECONNECT] {} broadcast failures — reconnecting (attempt {})...\x1b[0m", RECONNECT_AFTER_FAILURES, consecutive_reconnects);
                         let old_gossip = bcast_gossip_handle.read().await;
                         match reconnect_gossip_topic(
-                            reconnect_endpoint.clone(),
+                            _current_endpoint.clone(),
                             reconnect_node_key_bytes,
                             reconnect_dht_secret.clone(),
                             &*old_gossip,

@@ -32,6 +32,7 @@ const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const REJOIN_INTERVAL_SECS: u64 = 1800; // Re-join peers every 30 minutes to prevent topology drift
 const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
 const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
+const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3; // Create fresh endpoint after N consecutive reconnects
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
@@ -1035,7 +1036,9 @@ async fn main() -> anyhow::Result<()> {
             // Keep the router alive in this task; on reconnect we replace it
             // (dropping the old router aborts its accept loop without closing the endpoint)
             let mut _current_router = router;
+            let mut _current_endpoint = reconnect_endpoint.clone();
             let mut last_reconnect = std::time::Instant::now();
+            let mut consecutive_reconnects: u32 = 0;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
@@ -1046,7 +1049,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let failures = reconnect_failures.load(Ordering::Relaxed);
                 let requested = reconnect_requested.swap(false, Ordering::Relaxed);
-                if failures >= RECONNECT_AFTER_FAILURES || requested {
+                if !(failures >= RECONNECT_AFTER_FAILURES || requested) {
+                    // No reconnect needed this cycle — gossip is stable
+                    if consecutive_reconnects > 0
+                        && last_reconnect.elapsed() > std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)
+                    {
+                        consecutive_reconnects = 0;
+                    }
+                    continue;
+                }
+                {
                     // Reset failures immediately to prevent re-entrant reconnects
                     reconnect_failures.store(0, Ordering::Relaxed);
 
@@ -1055,7 +1067,40 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", failures);
+                    consecutive_reconnects += 1;
+
+                    // If we've reconnected multiple times without recovery, the endpoint
+                    // itself may be degraded (e.g., iroh path exhaustion). Create a fresh one.
+                    if consecutive_reconnects > ENDPOINT_RESET_AFTER_RECONNECTS {
+                        eprintln!(
+                            "\x1b[1;35m[RECONNECT] {} consecutive reconnects without recovery — creating fresh endpoint\x1b[0m",
+                            consecutive_reconnects
+                        );
+                        let node_key = iroh::SecretKey::from_bytes(&reconnect_node_key_bytes);
+                        match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                            .secret_key(node_key)
+                            .bind()
+                            .await
+                        {
+                            Ok(new_ep) => {
+                                // Close the old endpoint (non-blocking, best effort)
+                                let old_ep = _current_endpoint.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        old_ep.close(),
+                                    ).await.ok();
+                                });
+                                _current_endpoint = new_ep;
+                                eprintln!("\x1b[32m[RECONNECT] Fresh endpoint created successfully.\x1b[0m");
+                            }
+                            Err(e) => {
+                                eprintln!("\x1b[1;31m[RECONNECT] Failed to create fresh endpoint: {}. Reusing old one.\x1b[0m", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic (attempt {})...\x1b[0m", failures, consecutive_reconnects);
+                    }
 
                     // Shut down the old Gossip actor so all its internal dtt actors stop
                     {
@@ -1072,12 +1117,12 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         reconnect_dht_secret.clone().into_bytes(),
                     );
-                    // Spawn a fresh Gossip actor
+                    // Spawn a fresh Gossip actor on the current endpoint
                     let new_gossip = Gossip::builder()
                         .max_message_size(65536)
-                        .spawn(reconnect_endpoint.clone());
+                        .spawn(_current_endpoint.clone());
                     // Re-register the new gossip (and archive sync if active) with a fresh Router
-                    let mut new_router_builder = Router::builder(reconnect_endpoint.clone())
+                    let mut new_router_builder = Router::builder(_current_endpoint.clone())
                         .accept(iroh_gossip::ALPN, new_gossip.clone());
                     if let Some(ref db_arc) = reconnect_db {
                         let handler = ArchiveSyncHandler { db: db_arc.clone() };
@@ -1134,6 +1179,9 @@ async fn main() -> anyhow::Result<()> {
                                 reconnect_neighbor_count.store(0, Ordering::Relaxed);
                                 last_reconnect = std::time::Instant::now();
                                 reconnect_counter.fetch_add(1, Ordering::Relaxed);
+                                // Don't reset consecutive_reconnects here — wait for the
+                                // isolation detector to confirm we're actually receiving.
+                                // It will be reset when unique_sources > threshold.
                                 println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
                             }
                             Err(e) => {
