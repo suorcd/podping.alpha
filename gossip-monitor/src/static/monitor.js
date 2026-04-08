@@ -58,68 +58,121 @@ function renderTable(data) {
     tbody.innerHTML = html;
 }
 
+// Persistent graph state — survives data updates
+let graphG = null;
+let graphNodes = [];
+let graphLinks = [];
+let graphLink = null;
+let graphNode = null;
+let graphLabel = null;
+let graphInitialized = false;
+
 function renderGraph(data) {
     const svg = d3.select("#topology");
     const container = document.getElementById("graph-section");
     const width = container.clientWidth - 32;
     const height = 400;
     svg.attr("width", width).attr("height", height);
-    svg.selectAll("*").remove();
+
+    // One-time initialization
+    if (!graphInitialized) {
+        graphG = svg.append("g");
+        svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {
+            graphG.attr("transform", event.transform);
+        }));
+        graphInitialized = true;
+    }
+
+    // Build new node/link data, preserving positions from existing nodes
+    const oldPositions = {};
+    for (const n of graphNodes) {
+        oldPositions[n.id] = { x: n.x, y: n.y, vx: n.vx, vy: n.vy, fx: n.fx, fy: n.fy };
+    }
 
     const nodeMap = {};
-    const nodes = data.peers.map(p => {
-        const n = { id: p.node_id, label: p.friendly_name || shortId(p.node_id), stale: p.stale };
+    const newNodes = data.peers.map(p => {
+        const old = oldPositions[p.node_id];
+        const n = {
+            id: p.node_id,
+            label: p.friendly_name || shortId(p.node_id),
+            stale: p.stale,
+        };
+        // Preserve position if the node existed before
+        if (old) {
+            n.x = old.x; n.y = old.y;
+            n.vx = old.vx; n.vy = old.vy;
+            n.fx = old.fx; n.fy = old.fy;
+        }
         nodeMap[p.node_id] = n;
         return n;
     });
 
-    const links = data.edges
+    const newLinks = data.edges
         .filter(e => nodeMap[e.source] && nodeMap[e.target])
         .map(e => ({ source: e.source, target: e.target }));
 
-    const g = svg.append("g");
+    graphNodes = newNodes;
+    graphLinks = newLinks;
 
-    // Zoom
-    svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {
-        g.attr("transform", event.transform);
-    }));
+    // Update edges with data join (enter/update/exit)
+    graphLink = graphG.selectAll(".edge")
+        .data(graphLinks, d => d.source + "-" + d.target)
+        .join(
+            enter => enter.append("line").attr("class", "edge"),
+            update => update,
+            exit => exit.remove()
+        );
 
-    const link = g.selectAll(".edge")
-        .data(links)
-        .join("line")
-        .attr("class", "edge");
+    // Update nodes
+    graphNode = graphG.selectAll(".node")
+        .data(graphNodes, d => d.id)
+        .join(
+            enter => enter.append("circle")
+                .attr("r", 10)
+                .call(d3.drag()
+                    .on("start", dragStart)
+                    .on("drag", dragging)
+                    .on("end", dragEnd)),
+            update => update,
+            exit => exit.remove()
+        )
+        .attr("class", d => d.stale ? "node stale-node" : "node");
 
-    const node = g.selectAll(".node")
-        .data(nodes)
-        .join("circle")
-        .attr("class", d => d.stale ? "node stale-node" : "node")
-        .attr("r", 10)
-        .call(d3.drag()
-            .on("start", dragStart)
-            .on("drag", dragging)
-            .on("end", dragEnd));
+    // Update labels
+    graphLabel = graphG.selectAll(".label")
+        .data(graphNodes, d => d.id)
+        .join(
+            enter => enter.append("text")
+                .attr("class", "label")
+                .attr("dx", 14)
+                .attr("dy", 4),
+            update => update,
+            exit => exit.remove()
+        )
+        .text(d => d.label);
 
-    const label = g.selectAll(".label")
-        .data(nodes)
-        .join("text")
-        .attr("class", "label")
-        .text(d => d.label)
-        .attr("dx", 14)
-        .attr("dy", 4);
+    // Update simulation with new data — low alpha so it doesn't bounce
+    if (simulation) {
+        simulation.nodes(graphNodes);
+        simulation.force("link").links(graphLinks);
+        simulation.alpha(0.1).restart(); // gentle nudge, not a full restart
+    } else {
+        simulation = d3.forceSimulation(graphNodes)
+            .force("link", d3.forceLink(graphLinks).id(d => d.id).distance(80))
+            .force("charge", d3.forceManyBody().strength(-200))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .on("tick", tickGraph);
+    }
 
-    if (simulation) simulation.stop();
-    simulation = d3.forceSimulation(nodes)
-        .force("link", d3.forceLink(links).id(d => d.id).distance(80))
-        .force("charge", d3.forceManyBody().strength(-200))
-        .force("center", d3.forceCenter(width / 2, height / 2))
-        .on("tick", () => {
-            link.attr("x1", d => d.source.x)
-                .attr("y1", d => d.source.y)
-                .attr("x2", d => d.target.x)
-                .attr("y2", d => d.target.y);
-            node.attr("cx", d => d.x).attr("cy", d => d.y);
-            label.attr("x", d => d.x).attr("y", d => d.y);
-        });
+    function tickGraph() {
+        if (graphLink) graphLink
+            .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+            .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+        if (graphNode) graphNode
+            .attr("cx", d => d.x).attr("cy", d => d.y);
+        if (graphLabel) graphLabel
+            .attr("x", d => d.x).attr("y", d => d.y);
+    }
 
     function dragStart(event, d) {
         if (!event.active) simulation.alphaTarget(0.3).restart();
