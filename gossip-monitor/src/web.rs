@@ -1,4 +1,4 @@
-use crate::swarm::PeerRegistry;
+use crate::swarm::{PeerRegistry, SuggestionLog};
 use crate::topology;
 use axum::extract::State;
 use axum::http::header;
@@ -18,6 +18,7 @@ pub struct AppState {
     pub registry: Arc<PeerRegistry>,
     pub sse_tx: broadcast::Sender<String>,
     pub topology_analysis: Arc<RwLock<Option<topology::TopologyAnalysis>>>,
+    pub suggestion_log: Arc<SuggestionLog>,
 }
 
 /// Start the web server and return the broadcast sender for SSE pushes.
@@ -25,6 +26,7 @@ pub fn start_web_server(
     addr: SocketAddr,
     registry: Arc<PeerRegistry>,
     topology_analysis: Arc<RwLock<Option<topology::TopologyAnalysis>>>,
+    suggestion_log: Arc<SuggestionLog>,
 ) -> broadcast::Sender<String> {
     let (sse_tx, _) = broadcast::channel::<String>(256);
 
@@ -32,6 +34,7 @@ pub fn start_web_server(
         registry,
         sse_tx: sse_tx.clone(),
         topology_analysis,
+        suggestion_log,
     };
 
     let app = Router::new()
@@ -42,6 +45,7 @@ pub fn start_web_server(
         .route("/api/topology", get(topology_handler))
         .route("/api/events", get(events_handler))
         .route("/api/version", get(version_handler))
+        .route("/api/suggestions", get(suggestions_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -84,6 +88,10 @@ async fn topology_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn version_handler() -> impl IntoResponse {
     Json(serde_json::json!({"version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn suggestions_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({"entries": state.suggestion_log.entries()}))
 }
 
 async fn events_handler(

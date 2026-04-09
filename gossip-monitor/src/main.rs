@@ -184,7 +184,8 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(PeerRegistry::new());
     let topology_analysis: Arc<tokio::sync::RwLock<Option<topology::TopologyAnalysis>>> =
         Arc::new(tokio::sync::RwLock::new(None));
-    let sse_tx = web::start_web_server(web_bind_addr, registry.clone(), topology_analysis.clone());
+    let suggestion_log = Arc::new(swarm::SuggestionLog::new());
+    let sse_tx = web::start_web_server(web_bind_addr, registry.clone(), topology_analysis.clone(), suggestion_log.clone());
     println!("  Web server listening on {}", web_bind_addr);
 
     // Periodic task: broadcast SwarmSnapshot via SSE every 5 seconds
@@ -220,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let topo_broadcast_failures = broadcast_failures.clone();
     let topo_signing_key = signing_key.clone();
     let topo_analysis = topology_analysis.clone();
+    let topo_suggestion_log = suggestion_log.clone();
     let monitor_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -292,12 +294,26 @@ async fn main() -> anyhow::Result<()> {
                         {
                             Ok(Ok(_)) => {
                                 topo_broadcast_failures.store(0, Ordering::Relaxed);
+                                // Look up friendly name for the target
+                                let target_name = {
+                                    let snap = topo_registry.snapshot();
+                                    snap.peers.iter()
+                                        .find(|p| p.node_id == suggestion.target_node_id)
+                                        .and_then(|p| p.friendly_name.clone())
+                                };
                                 println!(
                                     "  [SUGGEST] Suggesting {} peers to {} (reason: {})",
                                     suggestion.suggested_peers.len(),
-                                    suggestion.target_node_id,
+                                    target_name.as_deref().unwrap_or(&suggestion.target_node_id),
                                     suggestion.reason
                                 );
+                                topo_suggestion_log.push(swarm::SuggestionLogEntry {
+                                    timestamp,
+                                    target_node_id: suggestion.target_node_id.clone(),
+                                    target_name,
+                                    suggested_peers: suggestion.suggested_peers.clone(),
+                                    reason: suggestion.reason.clone(),
+                                });
                                 last_suggest
                                     .insert(suggestion.target_node_id.clone(), now_instant);
                             }

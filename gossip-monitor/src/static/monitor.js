@@ -452,9 +452,51 @@ function connectSSE() {
     };
 }
 
+// ---- Suggestion Log ----
+
+async function fetchSuggestions() {
+    try {
+        var resp = await fetch("/api/suggestions");
+        if (resp.ok) {
+            var data = await resp.json();
+            renderSuggestionLog(data.entries || []);
+        }
+    } catch (e) {
+        console.error("Failed to fetch suggestions:", e);
+    }
+}
+
+function renderSuggestionLog(entries) {
+    var container = document.getElementById("suggestion-log");
+    if (!entries || entries.length === 0) {
+        container.innerHTML = '<p class="log-empty">No suggestions sent yet.</p>';
+        return;
+    }
+    // Show newest first
+    var html = "";
+    for (var i = entries.length - 1; i >= 0; i--) {
+        var e = entries[i];
+        var dt = new Date(e.timestamp * 1000);
+        var timeStr = dt.toLocaleTimeString();
+        var dateStr = dt.toLocaleDateString();
+        var targetDisplay = esc(e.target_name || shortId(e.target_node_id));
+        var peerList = e.suggested_peers.map(function(p) { return shortId(p); }).join(", ");
+        html += '<div class="log-entry">'
+            + '<span class="log-time">' + dateStr + " " + timeStr + '</span> '
+            + '<span class="log-reason">' + esc(e.reason) + '</span> '
+            + '<span class="log-arrow">&rarr;</span> '
+            + '<strong>' + targetDisplay + '</strong>: '
+            + '<span class="log-peers">join [' + esc(peerList) + ']</span>'
+            + '</div>';
+    }
+    container.innerHTML = html;
+}
+
 // ---- Init ----
 
 fetchVersion();
 fetchSwarm();
+fetchSuggestions();
 setInterval(fetchSwarm, 10000);
+setInterval(fetchSuggestions, 30000);
 connectSSE();

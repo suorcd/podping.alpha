@@ -68,6 +68,48 @@ pub struct MetricSample {
 /// Maximum number of metric samples retained per peer (~5 hours at 5-min intervals).
 const MAX_HISTORY_SAMPLES: usize = 60;
 
+/// Maximum number of suggestion log entries retained.
+const MAX_SUGGESTION_LOG: usize = 200;
+
+// ---------------------------------------------------------------------------
+// Suggestion log
+// ---------------------------------------------------------------------------
+
+/// A log entry recording a peer suggestion sent by the monitor.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestionLogEntry {
+    pub timestamp: u64,
+    pub target_node_id: String,
+    pub target_name: Option<String>,
+    pub suggested_peers: Vec<String>,
+    pub reason: String,
+}
+
+/// Thread-safe suggestion log.
+pub struct SuggestionLog {
+    entries: std::sync::Mutex<Vec<SuggestionLogEntry>>,
+}
+
+impl SuggestionLog {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn push(&self, entry: SuggestionLogEntry) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.push(entry);
+        if entries.len() > MAX_SUGGESTION_LOG {
+            entries.remove(0);
+        }
+    }
+
+    pub fn entries(&self) -> Vec<SuggestionLogEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot types
 // ---------------------------------------------------------------------------

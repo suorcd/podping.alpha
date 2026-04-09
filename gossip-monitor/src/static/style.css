@@ -240,3 +240,19 @@ tbody tr.stale {
 tbody tr.stale td {
     color: #888;
 }
+
+/* Suggestion Log */
+#log-section { grid-column: 1 / -1; }
+.suggestion-log {
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: "Consolas", "Fira Code", monospace;
+    font-size: 0.8em;
+    line-height: 1.6;
+}
+.log-empty { color: #666; font-style: italic; }
+.log-entry { padding: 2px 0; border-bottom: 1px solid #1a1a2e; }
+.log-time { color: #666; }
+.log-reason { color: #e94560; font-weight: 600; }
+.log-arrow { color: #666; margin: 0 4px; }
+.log-peers { color: #42a5f5; }
