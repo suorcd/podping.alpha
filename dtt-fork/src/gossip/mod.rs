@@ -49,6 +49,16 @@ pub trait AutoDiscoveryGossip {
         &self,
         record_publisher: RecordPublisher,
     ) -> anyhow::Result<Topic>;
+
+    /// Subscribe to a topic and bootstrap asynchronously, without starting
+    /// merge actors (BubbleMerge, MessageOverlapMerge). The DHT Publisher
+    /// still runs so this node remains discoverable. Use this when the
+    /// application handles topology maintenance itself.
+    #[allow(async_fn_in_trait)]
+    async fn subscribe_and_join_bootstrap_only(
+        &self,
+        record_publisher: RecordPublisher,
+    ) -> anyhow::Result<Topic>;
 }
 
 impl AutoDiscoveryGossip for iroh_gossip::net::Gossip {
@@ -56,13 +66,20 @@ impl AutoDiscoveryGossip for iroh_gossip::net::Gossip {
         &self,
         record_publisher: RecordPublisher,
     ) -> anyhow::Result<Topic> {
-        Topic::new(record_publisher, self.clone(), false).await
+        Topic::new(record_publisher, self.clone(), false, false).await
     }
 
     async fn subscribe_and_join_with_auto_discovery_no_wait(
         &self,
         record_publisher: RecordPublisher,
     ) -> anyhow::Result<Topic> {
-        Topic::new(record_publisher, self.clone(), true).await
+        Topic::new(record_publisher, self.clone(), true, false).await
+    }
+
+    async fn subscribe_and_join_bootstrap_only(
+        &self,
+        record_publisher: RecordPublisher,
+    ) -> anyhow::Result<Topic> {
+        Topic::new(record_publisher, self.clone(), true, true).await
     }
 }

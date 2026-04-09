@@ -92,6 +92,7 @@ impl Topic {
         record_publisher: crate::crypto::RecordPublisher,
         gossip: iroh_gossip::net::Gossip,
         async_bootstrap: bool,
+        skip_merge_actors: bool,
     ) -> Result<Self> {
         tracing::debug!(
             "Topic: creating new topic (async_bootstrap={})",
@@ -131,13 +132,17 @@ impl Topic {
         tracing::debug!("Topic: starting publisher");
         let _ = api.call(act!(actor => actor.start_publishing())).await;
 
-        tracing::debug!("Topic: starting bubble merge");
-        let _ = api.call(act!(actor => actor.start_bubble_merge())).await;
+        if !skip_merge_actors {
+            tracing::debug!("Topic: starting bubble merge");
+            let _ = api.call(act!(actor => actor.start_bubble_merge())).await;
 
-        tracing::debug!("Topic: starting message overlap merge");
-        let _ = api
-            .call(act!(actor => actor.start_message_overlap_merge()))
-            .await;
+            tracing::debug!("Topic: starting message overlap merge");
+            let _ = api
+                .call(act!(actor => actor.start_message_overlap_merge()))
+                .await;
+        } else {
+            tracing::debug!("Topic: skipping merge actors (bootstrap-only mode)");
+        }
 
         tracing::debug!("Topic: fully initialized");
         Ok(Self { api })
