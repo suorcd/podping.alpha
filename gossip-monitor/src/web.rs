@@ -41,6 +41,7 @@ pub fn start_web_server(
         .route("/api/swarm", get(swarm_handler))
         .route("/api/topology", get(topology_handler))
         .route("/api/events", get(events_handler))
+        .route("/api/version", get(version_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -79,6 +80,10 @@ async fn topology_handler(State(state): State<AppState>) -> impl IntoResponse {
         Some(analysis) => Json(serde_json::json!(analysis)),
         None => Json(serde_json::json!({})),
     }
+}
+
+async fn version_handler() -> impl IntoResponse {
+    Json(serde_json::json!({"version": env!("CARGO_PKG_VERSION")}))
 }
 
 async fn events_handler(

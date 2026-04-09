@@ -4,6 +4,9 @@
 let currentData = null;
 let simulation = null;
 
+// Map of node_id -> Chart.js instance for peer cards
+const chartInstances = new Map();
+
 // ---- Helpers ----
 
 function formatUptime(secs) {
@@ -23,6 +26,23 @@ function esc(s) {
 function shortId(id) {
     if (!id) return "";
     return id.length > 12 ? id.substring(0, 12) + "\u2026" : id;
+}
+
+// ---- Version fetch ----
+
+async function fetchVersion() {
+    try {
+        const resp = await fetch("/api/version");
+        if (resp.ok) {
+            const data = await resp.json();
+            const el = document.getElementById("header-title");
+            if (el && data.version) {
+                el.textContent = "Podping Gossip Monitor v" + data.version;
+            }
+        }
+    } catch (e) {
+        console.error("Failed to fetch version:", e);
+    }
 }
 
 // ---- Rendering ----
@@ -58,7 +78,212 @@ function renderTable(data) {
     tbody.innerHTML = html;
 }
 
-// Persistent graph state — survives data updates
+// ---- Peer Cards ----
+
+function buildTimeLabels(history, nowTs) {
+    return history.map(function(sample) {
+        var ago = Math.max(0, nowTs - sample.timestamp);
+        var mins = Math.round(ago / 60);
+        if (mins < 1) return "now";
+        return mins + "m ago";
+    });
+}
+
+function renderCards(data) {
+    var container = document.getElementById("peer-cards");
+    var nowTs = data.timestamp || Math.floor(Date.now() / 1000);
+
+    // Track which peers are still present
+    var activePeerIds = new Set();
+
+    for (var i = 0; i < data.peers.length; i++) {
+        var p = data.peers[i];
+        activePeerIds.add(p.node_id);
+
+        var cardId = "card-" + p.node_id;
+        var card = document.getElementById(cardId);
+        var canvasId = "chart-" + p.node_id;
+
+        if (!card) {
+            // Create new card
+            card = document.createElement("div");
+            card.id = cardId;
+            card.className = "peer-card" + (p.stale ? " stale" : "");
+            card.innerHTML =
+                '<div class="card-header">' +
+                    '<span class="peer-name"></span>' +
+                    '<span class="version-badge"></span>' +
+                    '<span class="status-dot"></span>' +
+                '</div>' +
+                '<div class="card-stats"></div>' +
+                '<div class="card-chart"><canvas id="' + canvasId + '"></canvas></div>' +
+                '<div class="card-footer"></div>';
+            container.appendChild(card);
+        }
+
+        // Update card class
+        card.className = "peer-card" + (p.stale ? " stale" : "");
+
+        // Header
+        var nameEl = card.querySelector(".peer-name");
+        nameEl.textContent = p.friendly_name || shortId(p.node_id);
+        nameEl.title = p.node_id;
+
+        card.querySelector(".version-badge").textContent = p.version || "-";
+
+        var dot = card.querySelector(".status-dot");
+        dot.className = "status-dot" + (p.stale ? " stale" : "");
+
+        // Stats
+        card.querySelector(".card-stats").innerHTML =
+            "<span>CPU: <strong>" + (p.cpu_percent != null ? p.cpu_percent.toFixed(1) + "%" : "-") + "</strong></span>" +
+            "<span>Mem: <strong>" + (p.memory_mb != null ? p.memory_mb + " MB" : "-") + "</strong></span>" +
+            "<span>Thr: <strong>" + (p.thread_count != null ? p.thread_count : "-") + "</strong></span>" +
+            "<span>Nbr: <strong>" + (p.neighbor_count != null ? p.neighbor_count : "-") + "</strong></span>" +
+            "<span>Up: <strong>" + formatUptime(p.uptime_secs) + "</strong></span>";
+
+        // Footer
+        var osBuild = [];
+        if (p.os) osBuild.push(p.os);
+        if (p.build_type) osBuild.push(p.build_type);
+        card.querySelector(".card-footer").innerHTML =
+            "<span>" + esc(osBuild.join(" / ") || "-") + "</span>" +
+            "<span>Reconn: " + (p.reconnect_count != null ? p.reconnect_count : "-") + "</span>" +
+            "<span>Msg age: " + (p.last_msg_age_secs != null ? p.last_msg_age_secs + "s" : "-") + "</span>" +
+            "<span>Rx: " + (p.msgs_received != null ? p.msgs_received : "-") +
+            " Tx: " + (p.msgs_sent != null ? p.msgs_sent : "-") + "</span>";
+
+        // Chart
+        var history = p.history || [];
+        var labels = buildTimeLabels(history, nowTs);
+        var cpuData = history.map(function(s) { return s.cpu_percent; });
+        var memData = history.map(function(s) { return s.memory_mb; });
+
+        var existingChart = chartInstances.get(p.node_id);
+        if (existingChart) {
+            // Update existing chart
+            existingChart.data.labels = labels;
+            existingChart.data.datasets[0].data = cpuData;
+            existingChart.data.datasets[1].data = memData;
+            existingChart.update("none"); // no animation for smooth updates
+        } else {
+            var canvas = document.getElementById(canvasId);
+            if (canvas) {
+                var ctx = canvas.getContext("2d");
+                var chart = new Chart(ctx, {
+                    type: "line",
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: "CPU %",
+                                data: cpuData,
+                                borderColor: "#42a5f5",
+                                backgroundColor: "rgba(66,165,245,0.1)",
+                                borderWidth: 1.5,
+                                pointRadius: 0,
+                                tension: 0.3,
+                                yAxisID: "y",
+                                fill: true
+                            },
+                            {
+                                label: "Mem MB",
+                                data: memData,
+                                borderColor: "#ef5350",
+                                backgroundColor: "rgba(239,83,80,0.1)",
+                                borderWidth: 1.5,
+                                pointRadius: 0,
+                                tension: 0.3,
+                                yAxisID: "y1",
+                                fill: true
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        interaction: {
+                            mode: "index",
+                            intersect: false
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: "top",
+                                labels: {
+                                    color: "#aaa",
+                                    font: { size: 10 },
+                                    boxWidth: 12,
+                                    padding: 6
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                display: true,
+                                ticks: {
+                                    color: "#666",
+                                    font: { size: 9 },
+                                    maxTicksLimit: 6
+                                },
+                                grid: { display: false }
+                            },
+                            y: {
+                                type: "linear",
+                                position: "left",
+                                min: 0,
+                                max: 100,
+                                title: {
+                                    display: false
+                                },
+                                ticks: {
+                                    color: "#42a5f5",
+                                    font: { size: 9 },
+                                    maxTicksLimit: 4
+                                },
+                                grid: {
+                                    color: "rgba(255,255,255,0.05)"
+                                }
+                            },
+                            y1: {
+                                type: "linear",
+                                position: "right",
+                                beginAtZero: true,
+                                title: {
+                                    display: false
+                                },
+                                ticks: {
+                                    color: "#ef5350",
+                                    font: { size: 9 },
+                                    maxTicksLimit: 4
+                                },
+                                grid: { display: false }
+                            }
+                        }
+                    }
+                });
+                chartInstances.set(p.node_id, chart);
+            }
+        }
+    }
+
+    // Remove cards for peers no longer in the data
+    var allCards = container.querySelectorAll(".peer-card");
+    for (var j = 0; j < allCards.length; j++) {
+        var cid = allCards[j].id.replace("card-", "");
+        if (!activePeerIds.has(cid)) {
+            var oldChart = chartInstances.get(cid);
+            if (oldChart) {
+                oldChart.destroy();
+                chartInstances.delete(cid);
+            }
+            allCards[j].remove();
+        }
+    }
+}
+
+// Persistent graph state -- survives data updates
 let graphG = null;
 let graphNodes = [];
 let graphLinks = [];
@@ -151,7 +376,7 @@ function renderGraph(data) {
         )
         .text(d => d.label);
 
-    // Update simulation with new data — low alpha so it doesn't bounce
+    // Update simulation with new data -- low alpha so it doesn't bounce
     if (simulation) {
         simulation.nodes(graphNodes);
         simulation.force("link").links(graphLinks);
@@ -193,6 +418,7 @@ function renderGraph(data) {
 function render(data) {
     currentData = data;
     renderSummary(data);
+    renderCards(data);
     renderTable(data);
     renderGraph(data);
 }
@@ -228,6 +454,7 @@ function connectSSE() {
 
 // ---- Init ----
 
+fetchVersion();
 fetchSwarm();
 setInterval(fetchSwarm, 10000);
 connectSSE();

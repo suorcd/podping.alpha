@@ -48,16 +48,18 @@ main {
     margin: 0 auto;
 }
 
-@media (min-width: 1200px) {
-    main {
-        grid-template-columns: 1fr 1fr;
-    }
-}
-
 section {
     background: #16213e;
     border-radius: 8px;
     padding: 1rem;
+}
+
+#cards-section {
+    grid-column: 1 / -1;
+}
+
+#table-section {
+    grid-column: 1 / -1;
 }
 
 section h2 {
@@ -101,6 +103,102 @@ section h2 {
     font-size: 11px;
     pointer-events: none;
     user-select: none;
+}
+
+/* ---- Peer Cards ---- */
+
+.peer-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1rem;
+}
+
+.peer-card {
+    background: #0f3460;
+    border: 1px solid #334;
+    border-radius: 8px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    transition: opacity 0.3s;
+}
+
+.peer-card.stale {
+    opacity: 0.4;
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.card-header .peer-name {
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: #e0e0e0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+}
+
+.card-header .version-badge {
+    background: #16213e;
+    color: #e94560;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4CAF50;
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.status-dot.stale {
+    background: #888;
+}
+
+.card-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    font-size: 0.78rem;
+    color: #bbb;
+}
+
+.card-stats span {
+    white-space: nowrap;
+}
+
+.card-stats strong {
+    color: #e0e0e0;
+}
+
+.card-chart {
+    height: 120px;
+    position: relative;
+}
+
+.card-chart canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+.card-footer {
+    font-size: 0.72rem;
+    color: #888;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1rem;
 }
 
 /* ---- Peer Table ---- */

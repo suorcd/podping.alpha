@@ -55,6 +55,20 @@ pub struct PeerAnnounce {
 }
 
 // ---------------------------------------------------------------------------
+// Metric history
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricSample {
+    pub timestamp: u64,
+    pub cpu_percent: Option<f32>,
+    pub memory_mb: Option<u64>,
+}
+
+/// Maximum number of metric samples retained per peer (~5 hours at 5-min intervals).
+const MAX_HISTORY_SAMPLES: usize = 60;
+
+// ---------------------------------------------------------------------------
 // Snapshot types
 // ---------------------------------------------------------------------------
 
@@ -77,6 +91,8 @@ pub struct PeerState {
     pub os: Option<String>,
     pub build_type: Option<String>,
     pub neighbors: Vec<String>,
+    #[serde(default)]
+    pub history: Vec<MetricSample>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,12 +117,14 @@ pub struct SwarmSnapshot {
 
 pub struct PeerRegistry {
     peers: RwLock<HashMap<String, PeerState>>,
+    history: RwLock<HashMap<String, Vec<MetricSample>>>,
 }
 
 impl PeerRegistry {
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
+            history: RwLock::new(HashMap::new()),
         }
     }
 
@@ -139,7 +157,24 @@ impl PeerRegistry {
             os: announce.os.clone(),
             build_type: announce.build_type.clone(),
             neighbors: announce.neighbors.clone().unwrap_or_default(),
+            history: Vec::new(), // populated in snapshot()
         };
+
+        // Record a metric sample when we have cpu or memory data
+        if announce.cpu_percent.is_some() || announce.memory_mb.is_some() {
+            let sample = MetricSample {
+                timestamp: now,
+                cpu_percent: announce.cpu_percent,
+                memory_mb: announce.memory_mb,
+            };
+            let mut hist = self.history.write().unwrap();
+            let samples = hist.entry(announce.node_id.clone()).or_default();
+            samples.push(sample);
+            if samples.len() > MAX_HISTORY_SAMPLES {
+                let excess = samples.len() - MAX_HISTORY_SAMPLES;
+                samples.drain(..excess);
+            }
+        }
 
         let mut map = self.peers.write().unwrap();
         map.insert(announce.node_id.clone(), state);
@@ -157,6 +192,14 @@ impl PeerRegistry {
         // Mark stale peers
         for peer in map.values_mut() {
             peer.stale = now.saturating_sub(peer.last_seen) > STALE_THRESHOLD_SECS;
+        }
+
+        // Populate history from the separate history map
+        let hist = self.history.read().unwrap();
+        for peer in map.values_mut() {
+            if let Some(samples) = hist.get(&peer.node_id) {
+                peer.history = samples.clone();
+            }
         }
 
         let mut peers: Vec<PeerState> = map.values().cloned().collect();
@@ -208,6 +251,14 @@ impl PeerRegistry {
         let mut map = self.peers.write().unwrap();
         let before = map.len();
         map.retain(|_, peer| now.saturating_sub(peer.last_seen) <= PRUNE_THRESHOLD_SECS);
-        before - map.len()
+        let removed = before - map.len();
+
+        // Also prune history for removed peers
+        if removed > 0 {
+            let mut hist = self.history.write().unwrap();
+            hist.retain(|id, _| map.contains_key(id));
+        }
+
+        removed
     }
 }
