@@ -309,7 +309,7 @@ function renderGraph(data) {
         // Set initial zoom level — 1.8x centered in the viewport
         const initialTransform = d3.zoomIdentity
             .translate(width / 2, height / 2)
-            .scale(1.8)
+            .scale(1.2)
             .translate(-width / 2, -height / 2);
         svg.call(zoom.transform, initialTransform);
         graphInitialized = true;
@@ -390,8 +390,8 @@ function renderGraph(data) {
         simulation.alpha(0.1).restart(); // gentle nudge, not a full restart
     } else {
         simulation = d3.forceSimulation(graphNodes)
-            .force("link", d3.forceLink(graphLinks).id(d => d.id).distance(80))
-            .force("charge", d3.forceManyBody().strength(-200))
+            .force("link", d3.forceLink(graphLinks).id(d => d.id).distance(160))
+            .force("charge", d3.forceManyBody().strength(-500))
             .force("center", d3.forceCenter(width / 2, height / 2))
             .on("tick", tickGraph);
     }
