@@ -35,7 +35,24 @@ const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation 
 const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
 const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3; // Create fresh endpoint after N consecutive reconnects
 const RECONNECT_AFTER_FAILURES: u64 = 5;
+const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
+const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
+
+/// Read process resident set size in bytes. Returns 0 on non-Linux or read failure.
+fn read_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
+                return pages * 4096;
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    { 0 }
+}
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 const DEFAULT_SSE_BIND_ADDR: &str = "0.0.0.0:8089";
 const DEFAULT_SSE_BUFFER_SIZE: usize = 1000;
@@ -833,6 +850,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let reconnect_notify = Arc::new(Notify::new());
+    let force_endpoint_reset = Arc::new(AtomicBool::new(false));
     let receive_generation = Arc::new(AtomicU64::new(0));
 
     //Joining peers from the known peers file serves as fallback/insurance if DHT no work
@@ -1076,6 +1094,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_failures = broadcast_failures.clone();
         let reconnect_requested = reconnect_requested.clone();
         let reconnect_notify = reconnect_notify.clone();
+        let reconnect_force_reset = force_endpoint_reset.clone();
         let reconnect_counter = reconnect_count.clone();
         let reconnect_neighbor_count = neighbor_count.clone();
         let reconnect_neighbor_ids = neighbor_ids.clone();
@@ -1114,7 +1133,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let failures = reconnect_failures.load(Ordering::Relaxed);
                 let requested = reconnect_requested.swap(false, Ordering::Relaxed);
-                if !(failures >= RECONNECT_AFTER_FAILURES || requested) {
+                let forced = reconnect_force_reset.swap(false, Ordering::Relaxed);
+                if !(failures >= RECONNECT_AFTER_FAILURES || requested || forced) {
                     // No reconnect needed this cycle — gossip is stable
                     if consecutive_reconnects > 0
                         && last_reconnect.elapsed() > std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)
@@ -1127,12 +1147,16 @@ async fn main() -> anyhow::Result<()> {
                     // Reset failures immediately to prevent re-entrant reconnects
                     reconnect_failures.store(0, Ordering::Relaxed);
 
-                    if last_reconnect.elapsed() < std::time::Duration::from_secs(30) {
+                    if !forced && last_reconnect.elapsed() < std::time::Duration::from_secs(30) {
                         eprintln!("\x1b[33m[RECONNECT] Skipping — reconnect cooldown active\x1b[0m");
                         continue;
                     }
 
                     consecutive_reconnects += 1;
+                    if forced {
+                        // Health-thread-driven recycle: force the fresh-endpoint branch
+                        consecutive_reconnects = ENDPOINT_RESET_AFTER_RECONNECTS + 1;
+                    }
 
                     // If we've reconnected multiple times without recovery, the endpoint
                     // itself may be degraded (e.g., iroh path exhaustion). Create a fresh one.
@@ -1317,9 +1341,13 @@ async fn main() -> anyhow::Result<()> {
         let h_notifs = notifications_received.clone();
         let h_failures = broadcast_failures.clone();
         let h_last_notif = last_notification_time.clone();
+        let h_force_reset = force_endpoint_reset.clone();
+        let h_reconnect_requested = reconnect_requested.clone();
+        let h_reconnect_notify = reconnect_notify.clone();
         tokio::spawn(async move {
             let mut prev_notifs: u64 = 0;
             let mut prev_failures: u64 = 0;
+            let mut last_reset = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 let notifs = h_notifs.load(Ordering::Relaxed);
@@ -1329,6 +1357,7 @@ async fn main() -> anyhow::Result<()> {
                 let since_last = now.saturating_sub(last_notif);
                 let delta_notifs = notifs - prev_notifs;
                 let delta_failures = failures.saturating_sub(prev_failures);
+                let rss_bytes = read_rss_bytes();
 
                 let status = if since_last > REBOOTSTRAP_TIMEOUT {
                     "\x1b[1;31mSTALLED\x1b[0m"
@@ -1339,9 +1368,25 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 println!(
-                    "\x1b[90m[HEALTH] {} | recv={} | bcast_failures={} | last_notif={}s ago\x1b[0m",
-                    status, delta_notifs, delta_failures, since_last,
+                    "\x1b[90m[HEALTH] {} | recv={} | bcast_failures={} | last_notif={}s ago | rss={}MB\x1b[0m",
+                    status, delta_notifs, delta_failures, since_last, rss_bytes / 1_048_576,
                 );
+
+                // Memory-bounded endpoint recycle: time-based (12h) + RSS-ceiling safety valve
+                let time_elapsed = last_reset.elapsed() >= std::time::Duration::from_secs(PERIODIC_RESET_INTERVAL_SECS);
+                let rss_exceeded = rss_bytes > RSS_CEILING_BYTES;
+                if time_elapsed || rss_exceeded {
+                    let reason = if rss_exceeded {
+                        format!("RSS {}MB exceeds ceiling {}MB", rss_bytes / 1_048_576, RSS_CEILING_BYTES / 1_048_576)
+                    } else {
+                        format!("{}h elapsed since last reset", last_reset.elapsed().as_secs() / 3600)
+                    };
+                    eprintln!("\x1b[1;35m[HEALTH] Triggering endpoint reset — {}\x1b[0m", reason);
+                    h_force_reset.store(true, Ordering::Relaxed);
+                    h_reconnect_requested.store(true, Ordering::Relaxed);
+                    h_reconnect_notify.notify_one();
+                    last_reset = std::time::Instant::now();
+                }
 
                 prev_notifs = notifs;
                 prev_failures = failures;

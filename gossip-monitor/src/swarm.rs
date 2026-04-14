@@ -14,6 +14,7 @@ const PRUNE_THRESHOLD_SECS: u64 = 1800;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PeerAnnounce {
     #[serde(rename = "type")]
     pub msg_type: String,

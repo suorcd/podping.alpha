@@ -345,6 +345,23 @@ const BATCH_INTERVAL_SECS: u64 = 3;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3;
+const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
+const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
+
+/// Read process resident set size in bytes. Returns 0 on non-Linux or read failure.
+fn read_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
+                return pages * 4096;
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    { 0 }
+}
 const MAX_RETRY_QUEUE: usize = 500;
 const MAX_GOSSIP_PAYLOAD: usize = 60000; // Must stay under max_message_size (65536) with overhead
 const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
@@ -600,6 +617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcast_failures = Arc::new(AtomicU64::new(0));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let reconnect_notify = Arc::new(Notify::new());
+    let force_endpoint_reset = Arc::new(AtomicBool::new(false));
     let receive_generation = Arc::new(AtomicU64::new(0));
 
     // --- Optionally join bootstrap peers ---
@@ -692,6 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_failure_count = broadcast_failures.clone();
     let bcast_reconnect_requested = reconnect_requested.clone();
     let bcast_reconnect_notify = reconnect_notify.clone();
+    let bcast_force_reset = force_endpoint_reset.clone();
     let bcast_gossip_handle = shared_gossip.clone();
     let bcast_msgs_received = msgs_received_counter.clone();
     let bcast_reconnect_counter = reconnect_count_counter.clone();
@@ -724,14 +743,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = bcast_reconnect_notify.notified() => {
-                    if !bcast_reconnect_requested.swap(false, Ordering::Relaxed) {
+                    let requested = bcast_reconnect_requested.swap(false, Ordering::Relaxed);
+                    let forced = bcast_force_reset.swap(false, Ordering::Relaxed);
+                    if !requested && !forced {
                         continue;
                     }
-                    if last_reconnect.elapsed() < std::time::Duration::from_secs(30) {
+                    if !forced && last_reconnect.elapsed() < std::time::Duration::from_secs(30) {
                         eprintln!("\x1b[33m[RECONNECT] Skipping — reconnect cooldown active\x1b[0m");
                         continue;
                     }
                     consecutive_reconnects += 1;
+                    if forced {
+                        // Health-thread-driven recycle: force the fresh-endpoint branch
+                        consecutive_reconnects = ENDPOINT_RESET_AFTER_RECONNECTS + 1;
+                    }
                     if consecutive_reconnects > ENDPOINT_RESET_AFTER_RECONNECTS {
                         eprintln!(
                             "\x1b[1;35m[RECONNECT] {} consecutive reconnects — creating fresh endpoint\x1b[0m",
@@ -1228,9 +1253,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let h_alive = health_broadcast_task_alive.clone();
         let h_shutdown = shutdown.clone();
         let h_tx = tx.clone();
+        let h_force_reset = force_endpoint_reset.clone();
+        let h_reconnect_requested = reconnect_requested.clone();
+        let h_reconnect_notify = reconnect_notify.clone();
         tokio::spawn(async move {
             let mut prev_sent: u64 = 0;
             let mut prev_failed: u64 = 0;
+            let mut last_reset = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 if h_shutdown.load(Ordering::Relaxed) {
@@ -1248,6 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let delta_sent = sent - prev_sent;
                 let delta_failed = failed - prev_failed;
                 let queue_len = h_tx.max_capacity() - h_tx.capacity();
+                let rss_bytes = read_rss_bytes();
 
                 let status = if !alive {
                     "\x1b[1;31mBROADCAST TASK DEAD\x1b[0m"
@@ -1260,9 +1290,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 println!(
-                    "\x1b[90m[HEALTH] {} | sent={} failed={} | queue={}/1000 | last_ok={}s ago\x1b[0m",
-                    status, delta_sent, delta_failed, queue_len, since_last,
+                    "\x1b[90m[HEALTH] {} | sent={} failed={} | queue={}/1000 | last_ok={}s ago | rss={}MB\x1b[0m",
+                    status, delta_sent, delta_failed, queue_len, since_last, rss_bytes / 1_048_576,
                 );
+
+                // Memory-bounded endpoint recycle: time-based (12h) + RSS-ceiling safety valve
+                let time_elapsed = last_reset.elapsed() >= std::time::Duration::from_secs(PERIODIC_RESET_INTERVAL_SECS);
+                let rss_exceeded = rss_bytes > RSS_CEILING_BYTES;
+                if time_elapsed || rss_exceeded {
+                    let reason = if rss_exceeded {
+                        format!("RSS {}MB exceeds ceiling {}MB", rss_bytes / 1_048_576, RSS_CEILING_BYTES / 1_048_576)
+                    } else {
+                        format!("{}h elapsed since last reset", last_reset.elapsed().as_secs() / 3600)
+                    };
+                    eprintln!("\x1b[1;35m[HEALTH] Triggering endpoint reset — {}\x1b[0m", reason);
+                    h_force_reset.store(true, Ordering::Relaxed);
+                    h_reconnect_requested.store(true, Ordering::Relaxed);
+                    h_reconnect_notify.notify_one();
+                    last_reset = std::time::Instant::now();
+                }
 
                 prev_sent = sent;
                 prev_failed = failed;
